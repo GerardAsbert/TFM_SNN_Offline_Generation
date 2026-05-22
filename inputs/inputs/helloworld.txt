@@ -1,0 +1,28 @@
+# -- Letter 'h' --
+0.00  0.40   # Up
+0.10  0.00   # Right
+0.00 -0.40   # Down
+0.05  0.00   # Small gap to separate letters
+
+# -- Letter 'e' --
+0.00  0.30   # Up
+0.15  0.00   # Right
+0.00 -0.20   # Down
+-0.15  0.00  # Left
+0.05  0.00   # Gap
+
+# -- Letter 'l' (first) --
+0.00  0.40   # Up
+0.00 -0.40   # Down
+0.05  0.00   # Gap
+
+# -- Letter 'l' (second) --
+0.00  0.40   # Up
+0.00 -0.40   # Down
+0.05  0.00   # Gap
+
+# -- Letter 'o' --
+0.20  0.00   # Right
+0.00  0.20   # Up
+-0.20  0.00  # Left
+0.00 -0.20   # Down
