@@ -1,0 +1,14 @@
+__pycache__/
+468j46mzdv-1/
+venv/
+
+MNIST-Sequence/dataset/mnist_sequence_neuromorphic.npz
+MNIST-Sequence/dataset/mnist_sequence.npz
+MNIST-Sequence/dataset/snn_sweep_refined_results.csv
+MNIST-Sequence/dataset/snn_sweep_results.csv
+MNIST-Sequence/data
+
+IAM/iam_local/
+
+*.pt
+*.pth
