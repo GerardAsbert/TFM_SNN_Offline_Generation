@@ -11,6 +11,10 @@ Modalities
 
 import math
 import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
 import pickle
 import numpy as np
 import torch
@@ -19,12 +23,13 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 from sklearn.metrics import mean_squared_error
 from tqdm import tqdm
+import wandb
 
 from models import HandwritingSNN
 
 
 # ── reproducibility ────────────────────────────────────────────────────────────
-rng_seed = 1
+rng_seed = 27
 np.random.seed(rng_seed)
 torch.manual_seed(rng_seed)
 
@@ -86,28 +91,28 @@ def build_targets(
 
 def generate_spikes_modal3(
     n_in: int,
-    n_sequences: int,
     seq_T: int,
     n_letras: int,
-    letras_por_secuencia,
     prob: float = 0.05,
-) -> np.ndarray:
+):
     """
-    Modality 3: one frozen Poisson spike train per letter.
-    Matches NEST modality-3 input encoding.
-    Returns (n_sequences, seq_T, n_in) float32.
+    Generate ONE frozen spike train per letter.
+    Returns a dictionary:
+        spikes_por_letra[letter_idx] -> (seq_T, n_in)
     """
-    spikes_por_letra = {}
-    for li in range(n_letras):
-        rng = np.random.RandomState(1000 + li)
-        s = (rng.rand(n_in, seq_T) < prob)
-        s[:, 0] = False
-        spikes_por_letra[li] = s.T.astype(np.float32)   # (seq_T, n_in)
 
-    return np.stack(
-        [spikes_por_letra[int(letras_por_secuencia[i])] for i in range(n_sequences)],
-        axis=0,
-    )
+    spikes_por_letra = {}
+
+    for li in tqdm(range(n_letras), desc="Generating spikes per character"):
+        rng = np.random.RandomState(1000 + li)
+
+        s = (rng.rand(seq_T, n_in) < prob).astype(np.float32)
+
+        s[:, 0] = 0
+
+        spikes_por_letra[li] = s
+
+    return spikes_por_letra
 
 
 def _jitter_spike_train(spikes: np.ndarray, window: int = 10) -> np.ndarray:
@@ -203,23 +208,28 @@ def analyze_and_plot(
     os.makedirs(output_dir, exist_ok=True)
 
     if loss_history:
-        plt.figure()
+        fig_loss = plt.figure()
         plt.plot(range(1, len(loss_history) + 1), loss_history)
         plt.xlabel("training iteration")
         plt.ylabel("MSE loss")
         plt.title("Training loss")
         plt.tight_layout()
         plt.savefig(f"{output_dir}/loss_training.png", dpi=300)
+        wandb.log({"charts/loss_curve": wandb.Image(fig_loss)})
         plt.close()
 
     t_pen_all = targets[:, :, 2].ravel()
     m_global = t_pen_all >= 0.5
 
+    global_metrics = {}
     for ch, name in enumerate(["dx", "dy", "pen"]):
         y_c = outputs[:, :, ch].ravel()
         t_c = targets[:, :, ch].ravel()
         sel = m_global if (ch < 2 and np.any(m_global)) else slice(None)
-        print(f"MSE {name}: {mean_squared_error(t_c[sel], y_c[sel]):.6f}")
+        mse_val = mean_squared_error(t_c[sel], y_c[sel])
+        print(f"MSE {name}: {mse_val:.6f}")
+        global_metrics[f"val/mse_{name}"] = mse_val
+    wandb.log(global_metrics)
 
     letras_unicas = sorted(np.unique(traj_idx_per_seq))
 
@@ -241,8 +251,13 @@ def analyze_and_plot(
 
         mse_x = mean_squared_error(t_dx[m_e], r_dx[m_e])
         mse_y = mean_squared_error(t_dy[m_e], r_dy[m_e])
-        print(f"  {nombre_base}: MSE_X={mse_x:.6f}  MSE_Y={mse_y:.6f}  "
-              f"avg={(mse_x + mse_y) / 2:.6f}")
+        mse_avg = (mse_x + mse_y) / 2
+        print(f"  {nombre_base}: MSE_X={mse_x:.6f}  MSE_Y={mse_y:.6f}  avg={mse_avg:.6f}")
+        wandb.log({
+            f"val/mse_x_{nombre_base}": mse_x,
+            f"val/mse_y_{nombre_base}": mse_y,
+            f"val/mse_avg_{nombre_base}": mse_avg,
+        })
 
         fig, ax = plt.subplots(figsize=(6, 3))
         for xs, ys in _segments_from_mask(t_dx, t_dy, mT):
@@ -260,6 +275,7 @@ def analyze_and_plot(
         )
         plt.tight_layout()
         plt.savefig(f"{output_dir}/{nombre_base}.png", dpi=300)
+        wandb.log({f"images/{nombre_base}": wandb.Image(fig)})
         plt.close()
 
     # mosaic of all letters (pen-down strokes only)
@@ -291,13 +307,16 @@ def analyze_and_plot(
         ax.axis("off")
         plt.tight_layout()
         plt.savefig(f"{output_dir}/mosaic.png", dpi=300)
+        wandb.log({"images/mosaic": wandb.Image(fig)})
         plt.close()
 
 
 # ── core training loop ─────────────────────────────────────────────────────────
 
 def run_training(
-    spikes_np,      # (n_sequences, seq_T, n_in)
+    spikes_dict,
+    letras_por_secuencia,   # (n_sequences,) int array: index into spikes_dict
+    n_sequences,     
     targets_np,     # (n_sequences, seq_T, 3)
     n_iter: int,
     n_batch: int,
@@ -308,6 +327,10 @@ def run_training(
     c_reg: float = 150.0,
     f_target: float = 20.0,
 ):
+    print(torch.cuda.is_available())
+    print(torch.cuda.device_count())
+    print(torch.cuda.get_device_name(0))
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on {device}  |  n_in={n_in}  n_rec={n_rec}  "
           f"n_iter={n_iter}  n_batch={n_batch}")
@@ -322,15 +345,24 @@ def run_training(
         model.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-8,
     )
 
-    n_sequences = spikes_np.shape[0]
+    spikes_torch = {
+        k: torch.from_numpy(v).to(device)
+        for k, v in spikes_dict.items()
+    }
+
     loss_history = []
+
+    targets_torch = torch.from_numpy(targets_np).to(device)
 
     for it in tqdm(range(n_iter), desc="E-prop"):
         start = (it * n_batch) % n_sequences
         idx = np.arange(start, start + n_batch) % n_sequences
 
-        x_b = torch.tensor(spikes_np[idx], device=device)   # (n_batch, seq_T, n_in)
-        t_b = torch.tensor(targets_np[idx], device=device)  # (n_batch, seq_T, 3)
+        x_b = torch.stack(
+            [spikes_torch[int(letras_por_secuencia[j])] for j in idx],
+            dim=0
+        )
+        t_b = targets_torch[idx]  # (n_batch, seq_T, 3)
 
         optimizer.zero_grad(set_to_none=True)
         out = model(x_b, targets=t_b)   # e-prop gradients assigned inside forward()
@@ -341,18 +373,30 @@ def run_training(
 
         optimizer.step()
 
+        wandb.log({"train/loss": loss_val}, step=it + 1)
+
         if (it + 1) % 100 == 0:
             print(f"  iter {it + 1:5d}/{n_iter}  loss={loss_val:.6f}")
 
     # Full inference pass to collect all predictions
     model.eval()
     all_out = []
+
     with torch.no_grad():
-        for i in range(0, n_sequences, max(n_batch, 1)):
-            end = min(i + max(n_batch, 1), n_sequences)
-            x_b = torch.tensor(spikes_np[i:end], device=device)
+        for i in range(0, n_sequences, n_batch):
+
+            end = min(i + n_batch, n_sequences)
+
+            idx = range(i, end) 
+
+            x_b = torch.stack(
+                [spikes_torch[int(letras_por_secuencia[j])] for j in idx],
+                dim=0
+            )
+
             all_out.append(model(x_b).cpu().numpy())
-    outputs_np = np.concatenate(all_out, axis=0)   # (n_sequences, seq_T, 3)
+
+    outputs_np = np.concatenate(all_out, axis=0)
 
     return model, outputs_np, loss_history
 
@@ -376,6 +420,9 @@ def main():
         n_in    = n_base + n_style
         n_rec   = 500
         n_out   = 3
+        lr      = 5e-3
+        c_reg   = 150.0
+        f_target = 20.0
         data_point = 8
         output_dir = "output_estilos_pytorch"
 
@@ -386,6 +433,36 @@ def main():
         datos_letras, trayectorias = load_dataset(dataset_path, n_letras)
         seq_T = len(datos_letras[0]) * data_point
         n_sequences = n_iter * n_batch
+
+        wandb.init(
+            project="snn-handwriting",
+            config={
+                "modality": 1,
+                "n_letras_distintas": n_letras_distintas,
+                "n_estilos_por_letra": n_estilos_por_letra,
+                "n_letras": n_letras,
+                "n_base": n_base,
+                "n_style": n_style,
+                "n_in": n_in,
+                "n_rec": n_rec,
+                "n_out": n_out,
+                "n_iter": n_iter,
+                "n_batch": n_batch,
+                "lr": lr,
+                "c_reg": c_reg,
+                "f_target_hz": f_target,
+                "data_point": data_point,
+                "seq_T": seq_T,
+                "dataset_path": dataset_path,
+                "rng_seed": rng_seed,
+                # SNN architecture
+                "tau_m_ms": 30.0,
+                "tau_a_ms": 2000.0,
+                "tau_out_ms": 50.0,
+                "threshold": 0.03,
+                "gamma": 0.3,
+            },
+        )
 
         # Build (letra, estilo) plan
         combinaciones = [
@@ -414,6 +491,7 @@ def main():
 
         model, outputs_np, loss_history = run_training(
             spikes_np, targets_np, n_iter, n_batch, n_in, n_rec, n_out,
+            lr=lr, c_reg=c_reg, f_target=f_target,
         )
 
         analyze_and_plot(
@@ -427,36 +505,74 @@ def main():
                 "n_in": n_in, "n_rec": n_rec, "n_out": n_out,
             }, f)
         print(f"Model saved to {output_dir}/modelo.pkl")
+        wandb.finish()
 
     # ── Modality 3: Alphabet Generation ───────────────────────────────────────
     elif tipo_modalidad == 3:
         n_letras_input = input("Number of letters to train [1]: ").strip()
         n_letras   = int(n_letras_input) if n_letras_input else 1
         n_iter     = 1000
-        n_batch    = 1
+        n_batch    = 32
         n_in       = 200
         n_rec      = 400
         n_out      = 3
+        lr         = 5e-3
+        c_reg      = 150.0
+        f_target   = 20.0
         data_point = 8
         output_dir = "abecedario_outputs_pytorch"
 
-        default_path = "/home/gerardasbert/Desktop/Master/TFM/snn_marc/hiragana"
+        default_path = "/home-local/gasbert/TFM_SNN_Offline_Generation/snn_marc/input_characters"
         path_input = input(f"Dataset path [{default_path}]: ").strip()
         dataset_path = path_input if path_input else default_path
 
         datos_letras, trayectorias = load_dataset(dataset_path, n_letras)
         seq_T = len(datos_letras[0]) * data_point
-        n_sequences = n_iter * n_batch
 
-        letras_por_secuencia = np.array([i % n_letras for i in range(n_sequences)], dtype=int)
+        wandb.init(
+            project="snn-handwriting",
+            config={
+                "modality": 3,
+                "n_letras": n_letras,
+                "n_in": n_in,
+                "n_rec": n_rec,
+                "n_out": n_out,
+                "n_iter": n_iter,
+                "n_batch": n_batch,
+                "lr": lr,
+                "c_reg": c_reg,
+                "f_target_hz": f_target,
+                "data_point": data_point,
+                "seq_T": seq_T,
+                "dataset_path": dataset_path,
+                "rng_seed": rng_seed,
+                # SNN architecture
+                "tau_m_ms": 30.0,
+                "tau_a_ms": 2000.0,
+                "tau_out_ms": 50.0,
+                "threshold": 0.03,
+                "gamma": 0.3,
+            },
+        )
+
+        letras_por_secuencia = np.random.randint(0, n_letras, size=256)
+        n_sequences = len(letras_por_secuencia)
+
         targets_np = build_targets(datos_letras, n_sequences, seq_T, data_point, letras_por_secuencia)
-        spikes_np  = generate_spikes_modal3(n_in, n_sequences, seq_T, n_letras, letras_por_secuencia)
-
+        print("Generating spikes...")
+        spikes_dict = generate_spikes_modal3(
+            n_in=n_in,
+            seq_T=seq_T,
+            n_letras=n_letras,
+        )
+        print("Saving sequences-to-character mapping...")
         os.makedirs(output_dir, exist_ok=True)
         np.save(f"{output_dir}/letras_por_secuencia.npy", letras_por_secuencia)
 
+        print("Starting training...")
         model, outputs_np, loss_history = run_training(
-            spikes_np, targets_np, n_iter, n_batch, n_in, n_rec, n_out,
+            spikes_dict, letras_por_secuencia, n_sequences, targets_np, n_iter, n_batch, n_in, n_rec, n_out,
+            lr=lr, c_reg=c_reg, f_target=f_target,
         )
 
         analyze_and_plot(
@@ -470,6 +586,7 @@ def main():
                 "n_in": n_in, "n_rec": n_rec, "n_out": n_out,
             }, f)
         print(f"Model saved to {output_dir}/modelo_abecedario.pkl")
+        wandb.finish()
 
     else:
         print("Modality not implemented.")
