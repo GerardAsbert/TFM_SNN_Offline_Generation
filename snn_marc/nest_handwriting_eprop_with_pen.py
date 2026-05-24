@@ -72,7 +72,7 @@ print("2.Generación de carácter")
 print("3.Generación de Abecedario")
 tipo_modalidad = int(input_mpi(""))  # <-- ya no habrá EOF en ranks > 0
 
-if tipo_modalidad == 1:
+'''if tipo_modalidad == 1:
     frecuencia_cambio_letra = 1
     n_iter = 1000
     n_letras_distintas = input("Elija numero de carácteres diferentes:")
@@ -641,7 +641,7 @@ if tipo_modalidad == 1:
         plt.savefig(f"{output_dir}/A_{estilo_name}.png", dpi=300)
         plt.close()
 
-    print("✅ Visualizaciones guardadas en la carpeta 'interpolacion'")
+    print("✅ Visualizaciones guardadas en la carpeta 'interpolacion'")'''
 #################################################################
 #################################################################
 #################################################################
@@ -649,7 +649,7 @@ if tipo_modalidad == 1:
 #################################################################
 #################################################################
 #################################################################
-elif tipo_modalidad == 3:
+if tipo_modalidad == 3:
     frecuencia_cambio_letra = 1
     n_iter = 1000
     n_batch = 1

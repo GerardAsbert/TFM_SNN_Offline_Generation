@@ -206,7 +206,8 @@ class HandwritingSNN(nn.Module):
                     z_trace = tau_trace * z_trace + z_h   # use z before this step
 
                     output_error = v_out - targets[:, t, :]           # (batch, n_out)
-                    learning_signal = output_error.matmul(self.B.t()) # (batch, n_rec)
+                    #learning_signal = output_error.matmul(self.B.t()) # (batch, n_rec) ### FEEDBACK ALIGNMENT
+                    learning_signal = output_error.matmul(self.readout.weight)  ### OPTION 1 — Symmetric e-prop (closest to backprop)
 
                     if self.c_reg > 0.0:
                         f_avg = tau_trace * f_avg + (1.0 - tau_trace) * z_h_new

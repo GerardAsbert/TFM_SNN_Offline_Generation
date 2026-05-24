@@ -275,7 +275,6 @@ def analyze_and_plot(
         )
         plt.tight_layout()
         plt.savefig(f"{output_dir}/{nombre_base}.png", dpi=300)
-        wandb.log({f"images/{nombre_base}": wandb.Image(fig)})
         plt.close()
 
     # mosaic of all letters (pen-down strokes only)
@@ -311,13 +310,59 @@ def analyze_and_plot(
         plt.close()
 
 
+# ── periodic image logging helper ─────────────────────────────────────────────
+
+def _log_character_images_to_wandb(
+    model, spikes_torch, letras_por_secuencia, targets_torch, trayectorias, step
+):
+    """Run inference and log one trajectory image per unique character to wandb."""
+    letras_unicas = sorted(set(int(l) for l in letras_por_secuencia))
+
+    with torch.no_grad():
+        for li in letras_unicas:
+            nombre_base = os.path.splitext(trayectorias[li])[0]
+            idxs = np.where(np.array(letras_por_secuencia) == li)[0]
+            last_i = idxs[-1]
+
+            x = spikes_torch[li].unsqueeze(0)         # (1, T, n_in)
+            out = model(x).cpu().numpy()[0]            # (T, 3)
+            tgt = targets_torch[last_i].cpu().numpy()  # (T, 3)
+
+            r_dx  = out[:, 0]; r_dy = -out[:, 1]; r_pen = out[:, 2]
+            t_dx  = tgt[:, 0]; t_dy = -tgt[:, 1]; t_pen = tgt[:, 2]
+
+            mR = r_pen >= 0.5
+            mT = t_pen >= 0.5
+            m_e = mT if np.any(mT) else slice(None)
+
+            mse_x = mean_squared_error(t_dx[m_e], r_dx[m_e])
+            mse_y = mean_squared_error(t_dy[m_e], r_dy[m_e])
+
+            fig, ax = plt.subplots(figsize=(6, 3))
+            for xs, ys in _segments_from_mask(t_dx, t_dy, mT):
+                ax.plot(xs, ys, color="tab:blue", label="target", alpha=0.85)
+            for xs, ys in _segments_from_mask(r_dx, r_dy, mR):
+                ax.plot(xs, ys, color="tab:red", label="readout", linewidth=1)
+            ax.set_title(f"{nombre_base}  iter {step}  MSE X:{mse_x:.4f} Y:{mse_y:.4f}")
+            ax.axis("equal")
+            ax.axis("off")
+            handles, labels = ax.get_legend_handles_labels()
+            ax.legend(
+                dict(zip(labels, handles)).values(),
+                dict(zip(labels, handles)).keys(),
+                loc="lower right", fontsize=8,
+            )
+            plt.tight_layout()
+            wandb.log({f"images/{nombre_base}": wandb.Image(fig)}, step=step)
+            plt.close()
+
+
 # ── core training loop ─────────────────────────────────────────────────────────
 
 def run_training(
     spikes_dict,
-    letras_por_secuencia,   # (n_sequences,) int array: index into spikes_dict
-    n_sequences,     
     targets_np,     # (n_sequences, seq_T, 3)
+    letras_ids,
     n_iter: int,
     n_batch: int,
     n_in: int,
@@ -326,6 +371,7 @@ def run_training(
     lr: float = 5e-3,
     c_reg: float = 150.0,
     f_target: float = 20.0,
+    trayectorias=None,
 ):
     print(torch.cuda.is_available())
     print(torch.cuda.device_count())
@@ -334,6 +380,8 @@ def run_training(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on {device}  |  n_in={n_in}  n_rec={n_rec}  "
           f"n_iter={n_iter}  n_batch={n_batch}")
+    
+    n_samples = len(targets_np)
 
     model = HandwritingSNN(
         n_in=n_in, n_rec=n_rec, n_out=n_out,
@@ -355,11 +403,11 @@ def run_training(
     targets_torch = torch.from_numpy(targets_np).to(device)
 
     for it in tqdm(range(n_iter), desc="E-prop"):
-        start = (it * n_batch) % n_sequences
-        idx = np.arange(start, start + n_batch) % n_sequences
+
+        idx = np.random.choice(n_samples, n_batch, replace=True)
 
         x_b = torch.stack(
-            [spikes_torch[int(letras_por_secuencia[j])] for j in idx],
+            [spikes_torch[j] for j in idx],
             dim=0
         )
         t_b = targets_torch[idx]  # (n_batch, seq_T, 3)
@@ -375,6 +423,11 @@ def run_training(
 
         wandb.log({"train/loss": loss_val}, step=it + 1)
 
+        if (it + 1) % 10 == 0 and trayectorias is not None:
+            _log_character_images_to_wandb(
+                model, spikes_torch, letras_ids, targets_torch, trayectorias, it + 1
+            )
+
         if (it + 1) % 100 == 0:
             print(f"  iter {it + 1:5d}/{n_iter}  loss={loss_val:.6f}")
 
@@ -383,14 +436,14 @@ def run_training(
     all_out = []
 
     with torch.no_grad():
-        for i in range(0, n_sequences, n_batch):
+        for i in range(0, n_samples, n_batch):
 
-            end = min(i + n_batch, n_sequences)
+            end = min(i + n_batch, n_samples)
 
             idx = range(i, end) 
 
             x_b = torch.stack(
-                [spikes_torch[int(letras_por_secuencia[j])] for j in idx],
+                [spikes_torch[j] for j in idx]
                 dim=0
             )
 
@@ -406,7 +459,7 @@ def main():
     print("  1. Style variation   (base + jitter encoding)")
     print("  3. Alphabet generation (one spike pattern per letter)")
     tipo_modalidad = int(input("Enter choice [1/3]: ").strip())
-
+    '''
     # ── Modality 1: Style Variation ────────────────────────────────────────────
     if tipo_modalidad == 1:
         n_letras_distintas = int(input("Number of distinct characters: ").strip())
@@ -491,7 +544,7 @@ def main():
 
         model, outputs_np, loss_history = run_training(
             spikes_np, targets_np, n_iter, n_batch, n_in, n_rec, n_out,
-            lr=lr, c_reg=c_reg, f_target=f_target,
+            lr=lr, c_reg=c_reg, f_target=f_target, trayectorias=trayectorias,
         )
 
         analyze_and_plot(
@@ -506,12 +559,12 @@ def main():
             }, f)
         print(f"Model saved to {output_dir}/modelo.pkl")
         wandb.finish()
-
+    '''
     # ── Modality 3: Alphabet Generation ───────────────────────────────────────
-    elif tipo_modalidad == 3:
+    if tipo_modalidad == 3:
         n_letras_input = input("Number of letters to train [1]: ").strip()
         n_letras   = int(n_letras_input) if n_letras_input else 1
-        n_iter     = 1000
+        n_iter     = 150
         n_batch    = 32
         n_in       = 200
         n_rec      = 400
@@ -555,28 +608,32 @@ def main():
             },
         )
 
-        letras_por_secuencia = np.random.randint(0, n_letras, size=256)
-        n_sequences = len(letras_por_secuencia)
+        letras_ids = np.arange(n_letras)
 
-        targets_np = build_targets(datos_letras, n_sequences, seq_T, data_point, letras_por_secuencia)
+        targets_np = build_targets(
+            datos_letras,
+            n_letras,
+            seq_T,
+            data_point,
+            letras_ids
+        )
         print("Generating spikes...")
         spikes_dict = generate_spikes_modal3(
             n_in=n_in,
             seq_T=seq_T,
             n_letras=n_letras,
         )
-        print("Saving sequences-to-character mapping...")
+
         os.makedirs(output_dir, exist_ok=True)
-        np.save(f"{output_dir}/letras_por_secuencia.npy", letras_por_secuencia)
 
         print("Starting training...")
         model, outputs_np, loss_history = run_training(
-            spikes_dict, letras_por_secuencia, n_sequences, targets_np, n_iter, n_batch, n_in, n_rec, n_out,
-            lr=lr, c_reg=c_reg, f_target=f_target,
+            spikes_dict, targets_np, letras_ids, n_iter, n_batch, n_in, n_rec, n_out,
+            lr=lr, c_reg=c_reg, f_target=f_target, trayectorias=trayectorias,
         )
 
         analyze_and_plot(
-            outputs_np, targets_np, letras_por_secuencia, trayectorias,
+            outputs_np, targets_np, letras_ids, trayectorias,
             output_dir, loss_history,
         )
 
