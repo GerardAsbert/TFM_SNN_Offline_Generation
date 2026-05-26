@@ -13,7 +13,7 @@ import math
 import os
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+#os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 import pickle
 import numpy as np
@@ -53,6 +53,55 @@ def load_dataset(dataset_path: str, n_letras: int):
             datos = np.hstack([datos, np.ones((datos.shape[0], 1), dtype=datos.dtype)])
         datos_letras.append(datos)
     return datos_letras, trayectorias
+
+
+def load_dataset2(dataset_path: str):
+    """
+    Load dataset with structure:
+        dataset_path/<author>/<symbol>/<instance>.txt
+
+    Returns:
+        data    : dict {author_idx: {symbol_idx: [np.ndarray, ...]}}
+        authors : sorted list of author directory names
+        symbols : sorted list of symbol directory names (union across all authors)
+    """
+    authors = sorted(
+        d for d in os.listdir(dataset_path)
+        if os.path.isdir(os.path.join(dataset_path, d))
+    )
+    if not authors:
+        raise ValueError(f"No author directories found in {dataset_path}")
+
+    all_symbols: set = set()
+    for author in authors:
+        author_path = os.path.join(dataset_path, author)
+        all_symbols.update(
+            d for d in os.listdir(author_path)
+            if os.path.isdir(os.path.join(author_path, d))
+        )
+    symbols = sorted(all_symbols)
+
+    data: dict = {}
+    for ai, author in enumerate(authors):
+        data[ai] = {}
+        author_path = os.path.join(dataset_path, author)
+        for si, symbol in enumerate(symbols):
+            symbol_path = os.path.join(author_path, symbol)
+            if not os.path.isdir(symbol_path):
+                data[ai][si] = []
+                continue
+            txt_files = sorted(f for f in os.listdir(symbol_path) if f.endswith(".txt"))
+            instances = []
+            for fname in txt_files:
+                arr = np.loadtxt(os.path.join(symbol_path, fname))
+                if arr.ndim != 2 or arr.shape[1] not in (2, 3):
+                    raise ValueError(f"{fname} must have 2 or 3 columns (dx, dy[, pen])")
+                if arr.shape[1] == 2:
+                    arr = np.hstack([arr, np.ones((arr.shape[0], 1), dtype=arr.dtype)])
+                instances.append(arr)
+            data[ai][si] = instances
+
+    return data, authors, symbols
 
 
 def build_targets(
@@ -113,6 +162,65 @@ def generate_spikes_modal3(
         spikes_por_letra[li] = s
 
     return spikes_por_letra
+
+def generate_spikes_character_and_style(
+    n_in: int,
+    seq_T: int,
+    n_letras: int,
+    n_authors: int,
+    data: dict,          # data[author_idx][symbol_idx] = [array, ...]
+    prob: float = 0.05,
+    jitter_window: int = 10,
+) -> dict:
+    """
+    Build spike trains for the character+style modality.
+
+    Each full spike train (seq_T, n_in) is the concatenation of:
+      - first half  (seq_T//2, n_in): frozen character pattern for that symbol
+      - second half (seq_T//2, n_in): base or jittered style pattern for that author
+
+    For each (author, symbol) pair with N instances:
+      instance 0       -> base style half (no jitter)
+      instance 1..N-1  -> jittered versions of the base style half
+
+    Returns dict keyed by (author_idx, symbol_idx, instance_idx) -> (seq_T, n_in) float32.
+    """
+    half_T = seq_T // 2
+
+    char_spikes = {}
+    for li in tqdm(range(n_letras), desc="Generating character spikes"):
+        rng = np.random.RandomState(li)
+        s = (rng.rand(half_T, n_in) < prob).astype(np.float32)
+        s[:, 0] = 0
+        char_spikes[li] = s  # (half_T, n_in)
+
+    style_base = {}
+    for ai in tqdm(range(n_authors), desc="Generating style base spikes"):
+        rng = np.random.RandomState(1000 + ai)
+        s = (rng.rand(half_T, n_in) < prob).astype(np.float32)
+        s[:, 0] = 0
+        style_base[ai] = s  # (half_T, n_in)
+
+    spikes = {}
+    for ai in range(n_authors):
+        for si in range(n_letras):
+            instances = data[ai].get(si, [])
+            for inst_idx in range(len(instances)):
+                char_half = char_spikes[si]
+                if inst_idx == 0:
+                    style_half = style_base[ai]
+                else:
+                    # _jitter_spike_train expects (n_neu, T); style_base is (half_T, n_in)
+                    np.random.seed(2000 + ai * 100_000 + si * 1000 + inst_idx)
+                    style_half = _jitter_spike_train(
+                        style_base[ai].T, window=jitter_window
+                    ).T.astype(np.float32)  # (half_T, n_in)
+                    style_half[:, 0] = 0
+                spikes[(ai, si, inst_idx)] = np.concatenate(
+                    [char_half, style_half], axis=0  # (seq_T, n_in)
+                )
+
+    return spikes
 
 
 def _jitter_spike_train(spikes: np.ndarray, window: int = 10) -> np.ndarray:
@@ -373,6 +481,8 @@ def run_training(
     f_target: float = 20.0,
     trayectorias=None,
 ):
+    print("At the start of run_training:")
+    print("CUDA_VISIBLE_DEVICES =", os.environ.get("CUDA_VISIBLE_DEVICES"))
     print(torch.cuda.is_available())
     print(torch.cuda.device_count())
     print(torch.cuda.get_device_name(0))
@@ -443,7 +553,7 @@ def run_training(
             idx = range(i, end) 
 
             x_b = torch.stack(
-                [spikes_torch[j] for j in idx]
+                [spikes_torch[j] for j in idx],
                 dim=0
             )
 
@@ -455,47 +565,61 @@ def run_training(
 
 
 def main():
+    print("At the start of main():")
+    print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+    print("torch.cuda.is_available():", torch.cuda.is_available())
+    print("torch.cuda.device_count():", torch.cuda.device_count())
+
     print("Choose a modality:")
-    print("  1. Style variation   (base + jitter encoding)")
+    print("  2. Character + style  (new hierarchical dataset)")
     print("  3. Alphabet generation (one spike pattern per letter)")
-    tipo_modalidad = int(input("Enter choice [1/3]: ").strip())
-    '''
-    # ── Modality 1: Style Variation ────────────────────────────────────────────
-    if tipo_modalidad == 1:
-        n_letras_distintas = int(input("Number of distinct characters: ").strip())
-        n_estilos_por_letra = int(input("Number of styles per character: ").strip())
-        n_letras = n_letras_distintas * n_estilos_por_letra
+    tipo_modalidad = int(input("Enter choice [2/3]: ").strip())
 
-        n_iter  = 1000
-        n_batch = n_letras_distintas
-        n_base  = 280
-        n_style = 20
-        n_in    = n_base + n_style
-        n_rec   = 500
-        n_out   = 3
-        lr      = 5e-3
-        c_reg   = 150.0
-        f_target = 20.0
+    # ── Modality 2: Character + Style ─────────────────────────────────────────
+    if tipo_modalidad == 2:
+        n_iter     = 500
+        n_batch    = 32
+        n_in       = 200
+        n_rec      = 400
+        n_out      = 3
+        lr         = 5e-3
+        c_reg      = 150.0
+        f_target   = 20.0
         data_point = 8
-        output_dir = "output_estilos_pytorch"
+        output_dir = "char_style_outputs_pytorch"
 
-        dataset_path = input(
-            "Dataset path [Dataset_estilos_A/Dataset_AA/prueba]: "
-        ).strip() or "Dataset_estilos_A/Dataset_AA/prueba"
+        default_path = "/data/113-2/users/gasbert/HOMUS_PROCESSED_mini"
+        path_input = input(f"Dataset path [{default_path}]: ").strip()
+        dataset_path = path_input if path_input else default_path
 
-        datos_letras, trayectorias = load_dataset(dataset_path, n_letras)
-        seq_T = len(datos_letras[0]) * data_point
-        n_sequences = n_iter * n_batch
+        data, authors, symbols = load_dataset2(dataset_path)
+        n_authors = len(authors)
+        n_letras  = len(symbols)
+
+        # seq_T from first available instance (all instances assumed same length)
+        seq_T = len(data[0][0][0]) * data_point
+
+        # Flatten (author, symbol, instance) triples into an ordered list so
+        # both datos_letras (for build_targets) and spikes_dict share the same
+        # integer index i for each (ai, si, inst_idx) triple.
+        flat_keys    = []   # (ai, si, inst_idx) in iteration order
+        datos_letras = []   # corresponding trajectory arrays
+        for ai in range(n_authors):
+            for si in range(n_letras):
+                for inst_idx, arr in enumerate(data[ai].get(si, [])):
+                    flat_keys.append((ai, si, inst_idx))
+                    datos_letras.append(arr)
+
+        n_sequences = len(datos_letras)
+        traj_idx_per_seq = np.arange(n_sequences, dtype=int)
 
         wandb.init(
             project="snn-handwriting",
             config={
-                "modality": 1,
-                "n_letras_distintas": n_letras_distintas,
-                "n_estilos_por_letra": n_estilos_por_letra,
+                "modality": 2,
+                "n_authors": n_authors,
                 "n_letras": n_letras,
-                "n_base": n_base,
-                "n_style": n_style,
+                "n_sequences": n_sequences,
                 "n_in": n_in,
                 "n_rec": n_rec,
                 "n_out": n_out,
@@ -508,7 +632,6 @@ def main():
                 "seq_T": seq_T,
                 "dataset_path": dataset_path,
                 "rng_seed": rng_seed,
-                # SNN architecture
                 "tau_m_ms": 30.0,
                 "tau_a_ms": 2000.0,
                 "tau_out_ms": 50.0,
@@ -517,33 +640,30 @@ def main():
             },
         )
 
-        # Build (letra, estilo) plan
-        combinaciones = [
-            (l, s)
-            for l in range(n_letras_distintas)
-            for s in range(n_estilos_por_letra)
-        ]
-        rep = math.ceil(n_sequences / len(combinaciones))
-        letras_estilos = np.array((combinaciones * rep)[:n_sequences])   # (n_sequences, 2)
-
-        # Each sequence maps to a unique trajectory file
-        traj_idx_per_seq = np.array(
-            [(letras_estilos[i, 0] * n_estilos_por_letra + letras_estilos[i, 1]) % n_letras
-             for i in range(n_sequences)],
-            dtype=int,
-        )
-
         targets_np = build_targets(datos_letras, n_sequences, seq_T, data_point, traj_idx_per_seq)
-        spikes_np  = generate_spikes_modal1(
-            n_base, n_style, n_letras_distintas, n_estilos_por_letra,
-            n_sequences, seq_T, letras_estilos,
+
+        print("Generating spikes...")
+        spikes_keyed = generate_spikes_character_and_style(
+            n_in=n_in,
+            seq_T=seq_T,
+            n_letras=n_letras,
+            n_authors=n_authors,
+            data=data,
         )
+        # Re-key with integers matching flat_keys order (run_training expects int keys)
+        spikes_dict = {i: spikes_keyed[k] for i, k in enumerate(flat_keys)}
+
+        # Labels for analyze_and_plot: "<author>_<symbol>_<inst_idx>"
+        trayectorias = [
+            f"{authors[ai]}_{symbols[si]}_{inst_idx}"
+            for ai, si, inst_idx in flat_keys
+        ]
 
         os.makedirs(output_dir, exist_ok=True)
-        np.save(f"{output_dir}/letras_estilos_por_secuencia.npy", letras_estilos)
 
+        print("Starting training...")
         model, outputs_np, loss_history = run_training(
-            spikes_np, targets_np, n_iter, n_batch, n_in, n_rec, n_out,
+            spikes_dict, targets_np, traj_idx_per_seq, n_iter, n_batch, n_in, n_rec, n_out,
             lr=lr, c_reg=c_reg, f_target=f_target, trayectorias=trayectorias,
         )
 
@@ -552,16 +672,16 @@ def main():
             output_dir, loss_history,
         )
 
-        with open(f"{output_dir}/modelo.pkl", "wb") as f:
+        with open(f"{output_dir}/modelo_char_style.pkl", "wb") as f:
             pickle.dump({
                 "state_dict": model.state_dict(),
                 "n_in": n_in, "n_rec": n_rec, "n_out": n_out,
             }, f)
-        print(f"Model saved to {output_dir}/modelo.pkl")
+        print(f"Model saved to {output_dir}/modelo_char_style.pkl")
         wandb.finish()
-    '''
+
     # ── Modality 3: Alphabet Generation ───────────────────────────────────────
-    if tipo_modalidad == 3:
+    elif tipo_modalidad == 3:
         n_letras_input = input("Number of letters to train [1]: ").strip()
         n_letras   = int(n_letras_input) if n_letras_input else 1
         n_iter     = 150
@@ -599,7 +719,6 @@ def main():
                 "seq_T": seq_T,
                 "dataset_path": dataset_path,
                 "rng_seed": rng_seed,
-                # SNN architecture
                 "tau_m_ms": 30.0,
                 "tau_a_ms": 2000.0,
                 "tau_out_ms": 50.0,
