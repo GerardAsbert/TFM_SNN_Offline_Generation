@@ -9,10 +9,11 @@ Modalities
 3. Alphabet generation – one frozen spike pattern per letter
 """
 
+import argparse
 import math
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 #os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 import pickle
@@ -565,207 +566,122 @@ def run_training(
 
 
 def main():
+
+    parser = argparse.ArgumentParser(description="PyTorch e-prop handwriting generation")
+
+    parser.add_argument(
+        "--dataset-path", "-d", type=str, default=None,
+        help="Path to the dataset directory (default depends on modality)",
+    )
+    args = parser.parse_args()
+
+
     print("At the start of main():")
     print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
     print("torch.cuda.is_available():", torch.cuda.is_available())
     print("torch.cuda.device_count():", torch.cuda.device_count())
 
-    print("Choose a modality:")
-    print("  2. Character + style  (new hierarchical dataset)")
-    print("  3. Alphabet generation (one spike pattern per letter)")
-    tipo_modalidad = int(input("Enter choice [2/3]: ").strip())
+    n_iter     = 1000
+    n_batch    = 32
+    n_in       = 200
+    n_rec      = 400
+    n_out      = 3
+    lr         = 5e-3
+    c_reg      = 150.0
+    f_target   = 20.0
+    data_point = 8
+    output_dir = "char_style_outputs_pytorch"
 
-    # ── Modality 2: Character + Style ─────────────────────────────────────────
-    if tipo_modalidad == 2:
-        n_iter     = 1000
-        n_batch    = 32
-        n_in       = 200
-        n_rec      = 400
-        n_out      = 3
-        lr         = 5e-3
-        c_reg      = 150.0
-        f_target   = 20.0
-        data_point = 8
-        output_dir = "char_style_outputs_pytorch"
+    dataset_path = args.dataset_path or "/data/113-2/users/gasbert/HOMUS_PROCESSED_mini"
 
-        default_path = "/data/113-2/users/gasbert/HOMUS_PROCESSED_mini"
-        path_input = input(f"Dataset path [{default_path}]: ").strip()
-        dataset_path = path_input if path_input else default_path
+    data, authors, symbols = load_dataset2(dataset_path)
+    n_authors = len(authors)
+    n_letras  = len(symbols)
 
-        data, authors, symbols = load_dataset2(dataset_path)
-        n_authors = len(authors)
-        n_letras  = len(symbols)
+    # seq_T from first available instance (all instances assumed same length)
+    seq_T = len(data[0][0][0]) * data_point
 
-        # seq_T from first available instance (all instances assumed same length)
-        seq_T = len(data[0][0][0]) * data_point
+    # Flatten (author, symbol, instance) triples into an ordered list so
+    # both datos_letras (for build_targets) and spikes_dict share the same
+    # integer index i for each (ai, si, inst_idx) triple.
+    flat_keys    = []   # (ai, si, inst_idx) in iteration order
+    datos_letras = []   # corresponding trajectory arrays
+    for ai in range(n_authors):
+        for si in range(n_letras):
+            for inst_idx, arr in enumerate(data[ai].get(si, [])):
+                flat_keys.append((ai, si, inst_idx))
+                datos_letras.append(arr)
 
-        # Flatten (author, symbol, instance) triples into an ordered list so
-        # both datos_letras (for build_targets) and spikes_dict share the same
-        # integer index i for each (ai, si, inst_idx) triple.
-        flat_keys    = []   # (ai, si, inst_idx) in iteration order
-        datos_letras = []   # corresponding trajectory arrays
-        for ai in range(n_authors):
-            for si in range(n_letras):
-                for inst_idx, arr in enumerate(data[ai].get(si, [])):
-                    flat_keys.append((ai, si, inst_idx))
-                    datos_letras.append(arr)
+    n_sequences = len(datos_letras)
+    traj_idx_per_seq = np.arange(n_sequences, dtype=int)
 
-        n_sequences = len(datos_letras)
-        traj_idx_per_seq = np.arange(n_sequences, dtype=int)
+    wandb.init(
+        project="snn-handwriting",
+        config={
+            "modality": 2,
+            "n_authors": n_authors,
+            "n_letras": n_letras,
+            "n_sequences": n_sequences,
+            "n_in": n_in,
+            "n_rec": n_rec,
+            "n_out": n_out,
+            "n_iter": n_iter,
+            "n_batch": n_batch,
+            "lr": lr,
+            "c_reg": c_reg,
+            "f_target_hz": f_target,
+            "data_point": data_point,
+            "seq_T": seq_T,
+            "dataset_path": dataset_path,
+            "rng_seed": rng_seed,
+            "tau_m_ms": 30.0,
+            "tau_a_ms": 2000.0,
+            "tau_out_ms": 50.0,
+            "threshold": 0.03,
+            "gamma": 0.3,
+        },
+    )
 
-        wandb.init(
-            project="snn-handwriting",
-            config={
-                "modality": 2,
-                "n_authors": n_authors,
-                "n_letras": n_letras,
-                "n_sequences": n_sequences,
-                "n_in": n_in,
-                "n_rec": n_rec,
-                "n_out": n_out,
-                "n_iter": n_iter,
-                "n_batch": n_batch,
-                "lr": lr,
-                "c_reg": c_reg,
-                "f_target_hz": f_target,
-                "data_point": data_point,
-                "seq_T": seq_T,
-                "dataset_path": dataset_path,
-                "rng_seed": rng_seed,
-                "tau_m_ms": 30.0,
-                "tau_a_ms": 2000.0,
-                "tau_out_ms": 50.0,
-                "threshold": 0.03,
-                "gamma": 0.3,
-            },
-        )
+    targets_np = build_targets(datos_letras, n_sequences, seq_T, data_point, traj_idx_per_seq)
 
-        targets_np = build_targets(datos_letras, n_sequences, seq_T, data_point, traj_idx_per_seq)
+    print("Generating spikes...")
+    spikes_keyed = generate_spikes_character_and_style(
+        n_in=n_in,
+        seq_T=seq_T,
+        n_letras=n_letras,
+        n_authors=n_authors,
+        data=data,
+    )
+    # Re-key with integers matching flat_keys order (run_training expects int keys)
+    spikes_dict = {i: spikes_keyed[k] for i, k in enumerate(flat_keys)}
 
-        print("Generating spikes...")
-        spikes_keyed = generate_spikes_character_and_style(
-            n_in=n_in,
-            seq_T=seq_T,
-            n_letras=n_letras,
-            n_authors=n_authors,
-            data=data,
-        )
-        # Re-key with integers matching flat_keys order (run_training expects int keys)
-        spikes_dict = {i: spikes_keyed[k] for i, k in enumerate(flat_keys)}
+    # Labels for analyze_and_plot: "<author>_<symbol>_<inst_idx>"
+    trayectorias = [
+        f"{authors[ai]}_{symbols[si]}_{inst_idx}"
+        for ai, si, inst_idx in flat_keys
+    ]
 
-        # Labels for analyze_and_plot: "<author>_<symbol>_<inst_idx>"
-        trayectorias = [
-            f"{authors[ai]}_{symbols[si]}_{inst_idx}"
-            for ai, si, inst_idx in flat_keys
-        ]
+    os.makedirs(output_dir, exist_ok=True)
 
-        os.makedirs(output_dir, exist_ok=True)
+    print("Starting training...")
+    model, outputs_np, loss_history = run_training(
+        spikes_dict, targets_np, traj_idx_per_seq, n_iter, n_batch, n_in, n_rec, n_out,
+        lr=lr, c_reg=c_reg, f_target=f_target, trayectorias=trayectorias,
+    )
 
-        print("Starting training...")
-        model, outputs_np, loss_history = run_training(
-            spikes_dict, targets_np, traj_idx_per_seq, n_iter, n_batch, n_in, n_rec, n_out,
-            lr=lr, c_reg=c_reg, f_target=f_target, trayectorias=trayectorias,
-        )
+    analyze_and_plot(
+        outputs_np, targets_np, traj_idx_per_seq, trayectorias,
+        output_dir, loss_history,
+    )
 
-        analyze_and_plot(
-            outputs_np, targets_np, traj_idx_per_seq, trayectorias,
-            output_dir, loss_history,
-        )
+    with open(f"{output_dir}/modelo_char_style.pkl", "wb") as f:
+        pickle.dump({
+            "state_dict": model.state_dict(),
+            "n_in": n_in, "n_rec": n_rec, "n_out": n_out,
+        }, f)
+    print(f"Model saved to {output_dir}/modelo_char_style.pkl")
+    wandb.finish()
 
-        with open(f"{output_dir}/modelo_char_style.pkl", "wb") as f:
-            pickle.dump({
-                "state_dict": model.state_dict(),
-                "n_in": n_in, "n_rec": n_rec, "n_out": n_out,
-            }, f)
-        print(f"Model saved to {output_dir}/modelo_char_style.pkl")
-        wandb.finish()
-
-    # ── Modality 3: Alphabet Generation ───────────────────────────────────────
-    elif tipo_modalidad == 3:
-        n_letras_input = input("Number of letters to train [1]: ").strip()
-        n_letras   = int(n_letras_input) if n_letras_input else 1
-        n_iter     = 150
-        n_batch    = 32
-        n_in       = 200
-        n_rec      = 400
-        n_out      = 3
-        lr         = 5e-3
-        c_reg      = 150.0
-        f_target   = 20.0
-        data_point = 8
-        output_dir = "abecedario_outputs_pytorch"
-
-        default_path = "/home-local/gasbert/TFM_SNN_Offline_Generation/snn_marc/input_characters"
-        path_input = input(f"Dataset path [{default_path}]: ").strip()
-        dataset_path = path_input if path_input else default_path
-
-        datos_letras, trayectorias = load_dataset(dataset_path, n_letras)
-        seq_T = len(datos_letras[0]) * data_point
-
-        wandb.init(
-            project="snn-handwriting",
-            config={
-                "modality": 3,
-                "n_letras": n_letras,
-                "n_in": n_in,
-                "n_rec": n_rec,
-                "n_out": n_out,
-                "n_iter": n_iter,
-                "n_batch": n_batch,
-                "lr": lr,
-                "c_reg": c_reg,
-                "f_target_hz": f_target,
-                "data_point": data_point,
-                "seq_T": seq_T,
-                "dataset_path": dataset_path,
-                "rng_seed": rng_seed,
-                "tau_m_ms": 30.0,
-                "tau_a_ms": 2000.0,
-                "tau_out_ms": 50.0,
-                "threshold": 0.03,
-                "gamma": 0.3,
-            },
-        )
-
-        letras_ids = np.arange(n_letras)
-
-        targets_np = build_targets(
-            datos_letras,
-            n_letras,
-            seq_T,
-            data_point,
-            letras_ids
-        )
-        print("Generating spikes...")
-        spikes_dict = generate_spikes_modal3(
-            n_in=n_in,
-            seq_T=seq_T,
-            n_letras=n_letras,
-        )
-
-        os.makedirs(output_dir, exist_ok=True)
-
-        print("Starting training...")
-        model, outputs_np, loss_history = run_training(
-            spikes_dict, targets_np, letras_ids, n_iter, n_batch, n_in, n_rec, n_out,
-            lr=lr, c_reg=c_reg, f_target=f_target, trayectorias=trayectorias,
-        )
-
-        analyze_and_plot(
-            outputs_np, targets_np, letras_ids, trayectorias,
-            output_dir, loss_history,
-        )
-
-        with open(f"{output_dir}/modelo_abecedario.pkl", "wb") as f:
-            pickle.dump({
-                "state_dict": model.state_dict(),
-                "n_in": n_in, "n_rec": n_rec, "n_out": n_out,
-            }, f)
-        print(f"Model saved to {output_dir}/modelo_abecedario.pkl")
-        wandb.finish()
-
-    else:
-        print("Modality not implemented.")
 
 
 if __name__ == "__main__":
