@@ -577,7 +577,7 @@ def main():
 
     # ── Modality 2: Character + Style ─────────────────────────────────────────
     if tipo_modalidad == 2:
-        n_iter     = 500
+        n_iter     = 1000
         n_batch    = 32
         n_in       = 200
         n_rec      = 400
