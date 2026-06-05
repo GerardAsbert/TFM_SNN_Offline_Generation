@@ -476,6 +476,7 @@ def run_training(
     n_batch: int,
     n_in: int,
     n_rec: int,
+    learning_signal_mode: str,
     n_out: int = 3,
     lr: float = 5e-3,
     c_reg: float = 150.0,
@@ -496,7 +497,7 @@ def run_training(
 
     model = HandwritingSNN(
         n_in=n_in, n_rec=n_rec, n_out=n_out,
-        c_reg=c_reg, f_target=f_target,
+        c_reg=c_reg, f_target=f_target, learning_signal_mode=learning_signal_mode,
     ).to(device)
 
     # Adam with same hyper-parameters as NEST (eta, beta_1, beta_2, epsilon)
@@ -524,7 +525,7 @@ def run_training(
         t_b = targets_torch[idx]  # (n_batch, seq_T, 3)
 
         optimizer.zero_grad(set_to_none=True)
-        out = model(x_b, targets=t_b)   # e-prop gradients assigned inside forward()
+        out = model(x_b, targets=t_b, log_step=it)   # e-prop gradients assigned inside forward()
 
         # MSE (for logging only — no .backward() needed)
         loss_val = 0.5 * float((out - t_b).pow(2).sum(dim=-1).mean())
@@ -572,6 +573,12 @@ def main():
     parser.add_argument(
         "--dataset-path", "-d", type=str, default=None,
         help="Path to the dataset directory (default depends on modality)",
+    )
+    parser.add_argument(
+        "--learning_signal",
+        type=str,
+        default="symmetric",
+        choices=["symmetric", "random", "adaptive"],
     )
     args = parser.parse_args()
 
@@ -666,7 +673,7 @@ def main():
     print("Starting training...")
     model, outputs_np, loss_history = run_training(
         spikes_dict, targets_np, traj_idx_per_seq, n_iter, n_batch, n_in, n_rec, n_out,
-        lr=lr, c_reg=c_reg, f_target=f_target, trayectorias=trayectorias,
+        lr=lr, c_reg=c_reg, f_target=f_target, trayectorias=trayectorias, learning_signal_mode=args.learning_signal
     )
 
     analyze_and_plot(

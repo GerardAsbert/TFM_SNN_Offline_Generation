@@ -13,6 +13,7 @@ Training uses e-prop with feedback alignment:
 import math
 import torch
 import torch.nn as nn
+import wandb
 
 
 class AdaptiveLIFLayer(nn.Module):
@@ -132,6 +133,7 @@ class HandwritingSNN(nn.Module):
         gamma: float = 0.3,
         f_target: float = 20.0,   # Hz, for optional firing-rate regularisation
         c_reg: float = 0.0,       # regularisation coefficient (0 = off)
+        learning_signal_mode: str = "symmetric",
     ):
         super().__init__()
         self.n_in = n_in
@@ -139,6 +141,7 @@ class HandwritingSNN(nn.Module):
         self.n_out = n_out
         self.f_target = f_target / 1000.0   # spikes per ms
         self.c_reg = c_reg
+        self.learning_signal_mode = learning_signal_mode
 
         tau_m = math.exp(-dt / tau_m_ms)
         tau_a = math.exp(-dt / tau_a_ms)
@@ -156,11 +159,20 @@ class HandwritingSNN(nn.Module):
         self.readout = nn.Linear(n_rec, n_out, bias=False)
         nn.init.normal_(self.readout.weight, std=1.0 / math.sqrt(n_rec))
 
-        # Fixed random feedback matrix (feedback alignment).
-        # Replaces NEST's eprop_learning_signal_connection_bsshslm_2020.
-        self.register_buffer("B", torch.randn(n_rec, n_out) / math.sqrt(n_rec))
 
-    def forward(self, x: torch.Tensor, targets: torch.Tensor = None) -> torch.Tensor:
+        if learning_signal_mode == "random":
+            self.register_buffer(
+                "B",
+                torch.randn(n_rec, n_out) / math.sqrt(n_rec)
+            )
+
+        elif learning_signal_mode == "adaptive":
+            self.B = nn.Parameter(
+                torch.randn(n_rec, n_out) / math.sqrt(n_rec)
+            )
+
+
+    def forward(self, x: torch.Tensor, targets: torch.Tensor = None, log_step: int = None) -> torch.Tensor:
         """
         Args
         ----
@@ -194,10 +206,14 @@ class HandwritingSNN(nn.Module):
         # Eligibility trace for output neurons
         z_out_trace = torch.zeros(batch, self.n_rec, device=device)
 
+
         if training:
             grad_inp = torch.zeros_like(self.hidden_layer.input_weights.weight)
             grad_rec = torch.zeros_like(self.hidden_layer.recurrent_weights.weight)
             grad_out = torch.zeros_like(self.readout.weight)
+
+            if self.learning_signal_mode == "adaptive":
+                grad_B = torch.zeros_like(self.B)
 
         outputs = []
 
@@ -255,8 +271,23 @@ class HandwritingSNN(nn.Module):
                     z_out_trace = self.tau_out * z_out_trace + z_h_new
 
                     output_error = v_out - targets[:, t, :]           # (batch, n_out)
-                    #learning_signal = output_error.matmul(self.B.t()) # (batch, n_rec) ### FEEDBACK ALIGNMENT
-                    learning_signal = output_error.matmul(self.readout.weight)  ### OPTION 1 — Symmetric e-prop (closest to backprop)
+
+                    if log_step is not None and t % 10 == 0:
+                        v_list   = v_out.detach().tolist()
+                        tgt_list = targets[:, t, :].detach().tolist()
+                        with open("debug_vectors.txt", "a") as _f:
+                            _f.write(f"step={log_step} t={t}\n")
+                            _f.write(f"  v_out:   {v_list}\n")
+                            _f.write(f"  targets: {tgt_list}\n")
+
+                    if self.learning_signal_mode == "adaptive":
+                        
+                        feedback_target = self.readout.weight.t()
+                        grad_B += (
+                            self.B - feedback_target
+                        ) / batch
+
+                    learning_signal = self.compute_learning_signal(output_error)
 
                     if self.c_reg > 0.0:
                         f_avg = tau_trace * f_avg + (1.0 - tau_trace) * z_h_new
@@ -280,4 +311,27 @@ class HandwritingSNN(nn.Module):
             self.hidden_layer.recurrent_weights.weight.grad = grad_rec
             self.readout.weight.grad = grad_out
 
+            if self.learning_signal_mode == "adaptive":
+                self.B.grad = grad_B
+
         return torch.stack(outputs, dim=1)  # (batch, T, n_out)
+    
+
+    def compute_learning_signal(
+        self,
+        output_error: torch.Tensor,
+    ) -> torch.Tensor:
+
+        if self.learning_signal_mode == "symmetric":
+            return output_error.matmul(self.readout.weight)
+
+        elif self.learning_signal_mode == "random":
+            return output_error.matmul(self.B.t())
+
+        elif self.learning_signal_mode == "adaptive":
+            return output_error.matmul(self.B.t())
+
+        else:
+            raise ValueError(
+                f"Unknown learning_signal_mode: {self.learning_signal_mode}"
+            )
