@@ -45,6 +45,7 @@ class AdaptiveLIFLayer(nn.Module):
         adapt_beta: float = None,   # prefactor of adaptive threshold
         gamma: float = 0.3,         # surrogate gradient scaling
         is_recurrent: bool = True,
+        w_gain: float = 1.0,        # weight init gain multiplier
     ):
         super().__init__()
         self.size = size
@@ -53,6 +54,7 @@ class AdaptiveLIFLayer(nn.Module):
         self.threshold = threshold
         self.gamma = gamma
         self.is_recurrent = is_recurrent
+        self.w_gain = w_gain
 
         if adapt_beta is None:
             adapt_beta = (
@@ -69,10 +71,10 @@ class AdaptiveLIFLayer(nn.Module):
 
     def _init_weights(self, input_size: int) -> None:
         with torch.no_grad():
-            nn.init.normal_(self.input_weights.weight, std=1.0 / math.sqrt(input_size))
+            nn.init.normal_(self.input_weights.weight, std=self.w_gain / math.sqrt(input_size))
             if self.is_recurrent:
                 nn.init.normal_(
-                    self.recurrent_weights.weight, std=1.0 / math.sqrt(self.size)
+                    self.recurrent_weights.weight, std=self.w_gain / math.sqrt(self.size)
                 )
                 self.recurrent_weights.weight.fill_diagonal_(0.0)  # no autapses
 
@@ -134,6 +136,7 @@ class HandwritingSNN(nn.Module):
         f_target: float = 20.0,   # Hz, for optional firing-rate regularisation
         c_reg: float = 0.0,       # regularisation coefficient (0 = off)
         learning_signal_mode: str = "symmetric",
+        w_gain: float = 1.0,      # weight init gain multiplier
     ):
         super().__init__()
         self.n_in = n_in
@@ -155,6 +158,7 @@ class HandwritingSNN(nn.Module):
             n_in, n_rec,
             tau_m=tau_m, tau_a=tau_a,
             threshold=threshold, adapt_beta=adapt_beta, gamma=gamma,
+            w_gain=w_gain,
         )
         self.readout = nn.Linear(n_rec, n_out, bias=False)
         nn.init.normal_(self.readout.weight, std=1.0 / math.sqrt(n_rec))

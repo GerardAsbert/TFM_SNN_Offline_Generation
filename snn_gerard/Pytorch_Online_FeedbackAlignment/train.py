@@ -35,6 +35,21 @@ np.random.seed(rng_seed)
 torch.manual_seed(rng_seed)
 
 
+# ── sweep defaults ─────────────────────────────────────────────────────────────
+
+DEFAULT_CONFIG = {
+    "threshold":            0.03,
+    "w_gain":               1.0,
+    "lr":                   5e-3,
+    "gamma":                0.3,
+    "c_reg":                150.0,
+    "n_rec":                400,
+    "tau_a_ms":             2000.0,
+    "prob":                 0.05,
+    "learning_signal_mode": "symmetric",
+}
+
+
 # ── dataset helpers ────────────────────────────────────────────────────────────
 
 def load_dataset(dataset_path: str, n_letras: int):
@@ -462,7 +477,6 @@ def _log_character_images_to_wandb(
                 loc="lower right", fontsize=8,
             )
             plt.tight_layout()
-            #wandb.log({f"images/{nombre_base}": wandb.Image(fig)}, step=step)
             wandb.log({f"images/{nombre_base}": wandb.Image(fig)})
             plt.close()
 
@@ -482,6 +496,10 @@ def run_training(
     lr: float = 5e-3,
     c_reg: float = 150.0,
     f_target: float = 20.0,
+    tau_a_ms: float = 2000.0,
+    gamma: float = 0.3,
+    threshold: float = 0.03,
+    w_gain: float = 1.0,
     trayectorias=None,
 ):
     print("At the start of run_training:")
@@ -493,12 +511,17 @@ def run_training(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on {device}  |  n_in={n_in}  n_rec={n_rec}  "
           f"n_iter={n_iter}  n_batch={n_batch}")
-    
+
     n_samples = len(targets_np)
 
     model = HandwritingSNN(
         n_in=n_in, n_rec=n_rec, n_out=n_out,
-        c_reg=c_reg, f_target=f_target, learning_signal_mode=learning_signal_mode,
+        c_reg=c_reg, f_target=f_target,
+        learning_signal_mode=learning_signal_mode,
+        tau_a_ms=tau_a_ms,
+        gamma=gamma,
+        threshold=threshold,
+        w_gain=w_gain,
     ).to(device)
 
     # Adam with same hyper-parameters as NEST (eta, beta_1, beta_2, epsilon)
@@ -534,7 +557,6 @@ def run_training(
 
         optimizer.step()
 
-        #wandb.log({"train/loss": loss_val}, step=it + 1)
         wandb.log({"train/loss": loss_val})
 
         if (it + 1) % 10 == 0 and trayectorias is not None:
@@ -554,7 +576,7 @@ def run_training(
 
             end = min(i + n_batch, n_samples)
 
-            idx = range(i, end) 
+            idx = range(i, end)
 
             x_b = torch.stack(
                 [spikes_torch[j] for j in idx],
@@ -566,6 +588,107 @@ def run_training(
     outputs_np = np.concatenate(all_out, axis=0)
 
     return model, outputs_np, loss_history
+
+
+# ── sweep-compatible training pipeline ────────────────────────────────────────
+
+def build_and_train(dataset_path: str, output_dir: str, n_iter: int, n_batch: int):
+    """
+    Core pipeline. Reads all sweep hyperparams from wandb.config.
+    wandb.init() must be called before this function.
+    """
+    cfg = wandb.config
+
+    # fixed (non-swept) hyperparams
+    n_in       = 200
+    n_out      = 3
+    f_target   = 20.0
+    data_point = 8
+
+    data, authors, symbols = load_dataset2(dataset_path)
+    n_authors = len(authors)
+    n_letras  = len(symbols)
+    seq_T = len(data[0][0][0]) * data_point
+
+    # Flatten (author, symbol, instance) triples into an ordered list so
+    # both datos_letras (for build_targets) and spikes_dict share the same
+    # integer index i for each (ai, si, inst_idx) triple.
+    flat_keys    = []
+    datos_letras = []
+    for ai in range(n_authors):
+        for si in range(n_letras):
+            for inst_idx, arr in enumerate(data[ai].get(si, [])):
+                flat_keys.append((ai, si, inst_idx))
+                datos_letras.append(arr)
+
+    n_sequences = len(datos_letras)
+    traj_idx_per_seq = np.arange(n_sequences, dtype=int)
+
+    # Log fixed hyperparams alongside the sweep params
+    wandb.config.update({
+        "n_in":        n_in,
+        "n_out":       n_out,
+        "n_authors":   n_authors,
+        "n_letras":    n_letras,
+        "n_sequences": n_sequences,
+        "n_iter":      n_iter,
+        "n_batch":     n_batch,
+        "f_target_hz": f_target,
+        "data_point":  data_point,
+        "seq_T":       seq_T,
+        "dataset_path": dataset_path,
+        "rng_seed":    rng_seed,
+        "tau_m_ms":    30.0,
+        "tau_out_ms":  50.0,
+    }, allow_val_change=True)
+
+    targets_np = build_targets(datos_letras, n_sequences, seq_T, data_point, traj_idx_per_seq)
+
+    print("Generating spikes...")
+    spikes_keyed = generate_spikes_character_and_style(
+        n_in=n_in,
+        seq_T=seq_T,
+        n_letras=n_letras,
+        n_authors=n_authors,
+        data=data,
+        prob=float(cfg.prob),
+    )
+    spikes_dict = {i: spikes_keyed[k] for i, k in enumerate(flat_keys)}
+
+    trayectorias = [
+        f"{authors[ai]}_{symbols[si]}_{inst_idx}"
+        for ai, si, inst_idx in flat_keys
+    ]
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("Starting training...")
+    model, outputs_np, loss_history = run_training(
+        spikes_dict, targets_np, traj_idx_per_seq, n_iter, n_batch,
+        n_in, int(cfg.n_rec),
+        learning_signal_mode=cfg.learning_signal_mode,
+        n_out=n_out,
+        lr=float(cfg.lr),
+        c_reg=float(cfg.c_reg),
+        f_target=f_target,
+        tau_a_ms=float(cfg.tau_a_ms),
+        gamma=float(cfg.gamma),
+        threshold=float(cfg.threshold),
+        w_gain=float(cfg.w_gain),
+        trayectorias=trayectorias,
+    )
+
+    analyze_and_plot(
+        outputs_np, targets_np, traj_idx_per_seq, trayectorias,
+        output_dir, loss_history,
+    )
+
+    with open(f"{output_dir}/modelo_char_style.pkl", "wb") as f:
+        pickle.dump({
+            "state_dict": model.state_dict(),
+            "n_in": n_in, "n_rec": int(cfg.n_rec), "n_out": n_out,
+        }, f)
+    print(f"Model saved to {output_dir}/modelo_char_style.pkl")
 
 
 def main():
@@ -581,9 +704,21 @@ def main():
         type=str,
         default="symmetric",
         choices=["symmetric", "random", "adaptive"],
+        help="Learning signal mode for standalone runs (ignored during sweeps)",
+    )
+    parser.add_argument(
+        "--sweep-id",
+        type=str,
+        default=None,
+        help="W&B sweep ID — run this agent as part of a sweep (create with: wandb sweep sweep.yaml)",
+    )
+    parser.add_argument(
+        "--sweep-count",
+        type=int,
+        default=None,
+        help="Number of runs this agent will execute (default: unlimited)",
     )
     args = parser.parse_args()
-
 
     print("At the start of main():")
     print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
@@ -592,107 +727,27 @@ def main():
 
     n_iter     = 1000
     n_batch    = 32
-    n_in       = 200
-    n_rec      = 400
-    n_out      = 3
-    lr         = 5e-3
-    c_reg      = 150.0
-    f_target   = 20.0
-    data_point = 8
     output_dir = "char_style_outputs_pytorch"
 
-    #dataset_path = args.dataset_path or "/data/113-2/users/gasbert/HOMUS_PROCESSED_mini"
     dataset_path = args.dataset_path or "/data/gasbert/TFM_SNN/HOMUS_PROCESSED_mini"
 
-    data, authors, symbols = load_dataset2(dataset_path)
-    n_authors = len(authors)
-    n_letras  = len(symbols)
+    if args.sweep_id:
+        # ── sweep agent mode ──────────────────────────────────────────────────
+        # wandb.agent calls _sweep_run() for each trial; the sweep controller
+        # fills wandb.config with the sampled hyperparams before the call.
+        def _sweep_run():
+            wandb.init()
+            build_and_train(dataset_path, output_dir, n_iter, n_batch)
+            wandb.finish()
 
-    # seq_T from first available instance (all instances assumed same length)
-    seq_T = len(data[0][0][0]) * data_point
+        wandb.agent(args.sweep_id, _sweep_run, count=args.sweep_count)
 
-    # Flatten (author, symbol, instance) triples into an ordered list so
-    # both datos_letras (for build_targets) and spikes_dict share the same
-    # integer index i for each (ai, si, inst_idx) triple.
-    flat_keys    = []   # (ai, si, inst_idx) in iteration order
-    datos_letras = []   # corresponding trajectory arrays
-    for ai in range(n_authors):
-        for si in range(n_letras):
-            for inst_idx, arr in enumerate(data[ai].get(si, [])):
-                flat_keys.append((ai, si, inst_idx))
-                datos_letras.append(arr)
-
-    n_sequences = len(datos_letras)
-    traj_idx_per_seq = np.arange(n_sequences, dtype=int)
-
-    wandb.init(
-        project="snn-handwriting",
-        config={
-            "modality": 2,
-            "n_authors": n_authors,
-            "n_letras": n_letras,
-            "n_sequences": n_sequences,
-            "n_in": n_in,
-            "n_rec": n_rec,
-            "n_out": n_out,
-            "n_iter": n_iter,
-            "n_batch": n_batch,
-            "lr": lr,
-            "c_reg": c_reg,
-            "f_target_hz": f_target,
-            "data_point": data_point,
-            "seq_T": seq_T,
-            "dataset_path": dataset_path,
-            "rng_seed": rng_seed,
-            "tau_m_ms": 30.0,
-            "tau_a_ms": 2000.0,
-            "tau_out_ms": 50.0,
-            "threshold": 0.03,
-            "gamma": 0.3,
-        },
-
-    )
-
-    targets_np = build_targets(datos_letras, n_sequences, seq_T, data_point, traj_idx_per_seq)
-
-    print("Generating spikes...")
-    spikes_keyed = generate_spikes_character_and_style(
-        n_in=n_in,
-        seq_T=seq_T,
-        n_letras=n_letras,
-        n_authors=n_authors,
-        data=data,
-    )
-    # Re-key with integers matching flat_keys order (run_training expects int keys)
-    spikes_dict = {i: spikes_keyed[k] for i, k in enumerate(flat_keys)}
-
-    # Labels for analyze_and_plot: "<author>_<symbol>_<inst_idx>"
-    trayectorias = [
-        f"{authors[ai]}_{symbols[si]}_{inst_idx}"
-        for ai, si, inst_idx in flat_keys
-    ]
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    print("Starting training...")
-    model, outputs_np, loss_history = run_training(
-        spikes_dict, targets_np, traj_idx_per_seq, n_iter, n_batch, n_in, n_rec, learning_signal_mode=args.learning_signal, n_out=n_out, 
-        lr=lr, c_reg=c_reg, f_target=f_target, trayectorias=trayectorias
-    )
-
-    analyze_and_plot(
-        outputs_np, targets_np, traj_idx_per_seq, trayectorias,
-        output_dir, loss_history,
-    )
-
-    with open(f"{output_dir}/modelo_char_style.pkl", "wb") as f:
-        pickle.dump({
-            "state_dict": model.state_dict(),
-            "n_in": n_in, "n_rec": n_rec, "n_out": n_out,
-        }, f)
-    print(f"Model saved to {output_dir}/modelo_char_style.pkl")
-    wandb.finish()
-
+    else:
+        # ── standalone run ────────────────────────────────────────────────────
+        config = {**DEFAULT_CONFIG, "learning_signal_mode": args.learning_signal}
+        wandb.init(project="snn-handwriting", config=config)
+        build_and_train(dataset_path, output_dir, n_iter, n_batch)
+        wandb.finish()
 
 
 if __name__ == "__main__":
