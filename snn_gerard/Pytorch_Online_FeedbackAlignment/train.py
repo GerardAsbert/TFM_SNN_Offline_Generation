@@ -13,7 +13,7 @@ import argparse
 import math
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 #os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 import pickle
@@ -462,7 +462,8 @@ def _log_character_images_to_wandb(
                 loc="lower right", fontsize=8,
             )
             plt.tight_layout()
-            wandb.log({f"images/{nombre_base}": wandb.Image(fig)}, step=step)
+            #wandb.log({f"images/{nombre_base}": wandb.Image(fig)}, step=step)
+            wandb.log({f"images/{nombre_base}": wandb.Image(fig)})
             plt.close()
 
 
@@ -533,7 +534,8 @@ def run_training(
 
         optimizer.step()
 
-        wandb.log({"train/loss": loss_val}, step=it + 1)
+        #wandb.log({"train/loss": loss_val}, step=it + 1)
+        wandb.log({"train/loss": loss_val})
 
         if (it + 1) % 10 == 0 and trayectorias is not None:
             _log_character_images_to_wandb(
@@ -599,7 +601,8 @@ def main():
     data_point = 8
     output_dir = "char_style_outputs_pytorch"
 
-    dataset_path = args.dataset_path or "/data/113-2/users/gasbert/HOMUS_PROCESSED_mini"
+    #dataset_path = args.dataset_path or "/data/113-2/users/gasbert/HOMUS_PROCESSED_mini"
+    dataset_path = args.dataset_path or "/data/gasbert/TFM_SNN/HOMUS_PROCESSED_mini"
 
     data, authors, symbols = load_dataset2(dataset_path)
     n_authors = len(authors)
@@ -647,6 +650,7 @@ def main():
             "threshold": 0.03,
             "gamma": 0.3,
         },
+
     )
 
     targets_np = build_targets(datos_letras, n_sequences, seq_T, data_point, traj_idx_per_seq)
@@ -672,8 +676,8 @@ def main():
 
     print("Starting training...")
     model, outputs_np, loss_history = run_training(
-        spikes_dict, targets_np, traj_idx_per_seq, n_iter, n_batch, n_in, n_rec, n_out,
-        lr=lr, c_reg=c_reg, f_target=f_target, trayectorias=trayectorias, learning_signal_mode=args.learning_signal
+        spikes_dict, targets_np, traj_idx_per_seq, n_iter, n_batch, n_in, n_rec, learning_signal_mode=args.learning_signal, n_out=n_out, 
+        lr=lr, c_reg=c_reg, f_target=f_target, trayectorias=trayectorias
     )
 
     analyze_and_plot(

@@ -272,13 +272,20 @@ class HandwritingSNN(nn.Module):
 
                     output_error = v_out - targets[:, t, :]           # (batch, n_out)
 
-                    if log_step is not None and t % 10 == 0:
+                    if t % 10 == 0:
+                        error_scalar = output_error.abs().mean().item()
+                        global_step = log_step * T + t
+                        wandb.log(
+                            {"training/output_error": error_scalar, 'training/training_step': global_step}
+                        )
+
+                    '''if log_step is not None and t % 10 == 0:
                         v_list   = v_out.detach().tolist()
                         tgt_list = targets[:, t, :].detach().tolist()
                         with open("debug_vectors.txt", "a") as _f:
                             _f.write(f"step={log_step} t={t}\n")
                             _f.write(f"  v_out:   {v_list}\n")
-                            _f.write(f"  targets: {tgt_list}\n")
+                            _f.write(f"  targets: {tgt_list}\n")'''
 
                     if self.learning_signal_mode == "adaptive":
                         
@@ -291,12 +298,18 @@ class HandwritingSNN(nn.Module):
 
                     if self.c_reg > 0.0:
                         f_avg = tau_trace * f_avg + (1.0 - tau_trace) * z_h_new
-                        learning_signal = learning_signal + self.c_reg * (self.f_target - f_avg)
+                        learning_signal = learning_signal + self.c_reg * (f_avg - self.f_target)
 
                     #post_factor = learning_signal * sg                 # (batch, n_rec)
                     grad_inp += torch.einsum("bj,bji->ji", learning_signal, e_in) / batch
                     grad_rec += torch.einsum("bj,bji->ji", learning_signal, e_rec) / batch
                     grad_out += torch.einsum("bo,bh->oh", output_error, z_out_trace) / batch
+
+                    wandb.log({
+                        "diag/rate": z_h_new.mean().item(),   # expect ~1.0 (should be ~0.02)
+                        "diag/psi":  sg.mean().item(),          # expect ~0
+                        "diag/v_abs": v_h.abs().mean().item()   # expect huge
+                    }) 
 
                     eps_v_in = eps_v_in_new
                     eps_a_in = eps_a_in_new
