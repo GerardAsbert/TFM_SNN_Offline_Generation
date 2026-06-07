@@ -239,38 +239,29 @@ class HandwritingSNN(nn.Module):
 
                     # Eligibility traces (ET) (low-pass filtered pre-synaptic activity)
                     # epsilon regarding voltage of input neurons
-                    eps_v_in_new = (
-                        self.hidden_layer.tau_m * eps_v_in
-                        - self.hidden_layer.adapt_beta * psi * eps_a_in
-                        + x_pre
-                    )
+                    eps_v_in_new = self.hidden_layer.tau_m * eps_v_in + x_pre
+
                     # epsilon regarding adaptation of input neurons
                     eps_a_in_new = (
-                        psi * eps_v_in_new
-                        + self.hidden_layer.tau_a * eps_a_in
+                        psi * eps_v_in
+                        + (self.hidden_layer.tau_a - self.hidden_layer.adapt_beta * psi) * eps_a_in
                     )
+
                     # epsilon regarding voltage of recurrent neurons
-                    eps_v_rec_new = (
-                        self.hidden_layer.tau_m * eps_v_rec
-                        - self.hidden_layer.adapt_beta * psi * eps_a_rec
-                        + z_pre
-                    )
+                    eps_v_rec_new = self.hidden_layer.tau_m * eps_v_rec + z_pre
+
                     # epsilon regarding adaptation of recurrent neurons
                     eps_a_rec_new = (
-                        psi * eps_v_rec_new
-                        + self.hidden_layer.tau_a * eps_a_rec
+                        psi * eps_v_rec
+                        + (self.hidden_layer.tau_a - self.hidden_layer.adapt_beta * psi) * eps_a_rec
                     )
 
                     # ET for input neurons
-                    e_in = psi * (
-                        eps_v_in_new
-                        - self.hidden_layer.adapt_beta * eps_a_in_new
-                    )
+                    e_in = psi * (eps_v_in_new - self.hidden_layer.adapt_beta * eps_a_in_new)
+
                     # ET for recurrent neurons
-                    e_rec = psi * (
-                        eps_v_rec_new
-                        - self.hidden_layer.adapt_beta * eps_a_rec_new
-                    )
+                    e_rec = psi * (eps_v_rec_new - self.hidden_layer.adapt_beta * eps_a_rec_new)
+                    
                     # ET for output neurons
                     z_out_trace = self.tau_out * z_out_trace + z_h_new
 

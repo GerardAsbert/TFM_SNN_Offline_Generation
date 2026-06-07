@@ -20,6 +20,10 @@ import pickle
 import numpy as np
 import torch
 import torch.optim as optim
+
+import matplotlib
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 from collections import defaultdict
 from sklearn.metrics import mean_squared_error
@@ -38,14 +42,14 @@ torch.manual_seed(rng_seed)
 # ── sweep defaults ─────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
-    "threshold":            0.03,
-    "w_gain":               1.0,
-    "lr":                   5e-3,
-    "gamma":                0.3,
-    "c_reg":                150.0,
-    "n_rec":                400,
-    "tau_a_ms":             2000.0,
-    "prob":                 0.05,
+    "threshold":            0.06,
+    "w_gain":               0.1,
+    "lr":                   5e-4,
+    "gamma":                0.79,
+    "c_reg":                99.90,
+    "n_rec":                800,
+    "tau_a_ms":             213.36,
+    "prob":                 0.12,
     "learning_signal_mode": "symmetric",
 }
 
@@ -725,11 +729,12 @@ def main():
     print("torch.cuda.is_available():", torch.cuda.is_available())
     print("torch.cuda.device_count():", torch.cuda.device_count())
 
-    n_iter     = 1000
+    n_iter     = 1200
     n_batch    = 32
     output_dir = "char_style_outputs_pytorch"
 
-    dataset_path = args.dataset_path or "/data/gasbert/TFM_SNN/HOMUS_PROCESSED_mini"
+    #dataset_path = args.dataset_path or "/data/gasbert/TFM_SNN/HOMUS_PROCESSED_mini"
+    dataset_path = args.dataset_path or "/data/113-2/users/gasbert/HOMUS_PROCESSED_mini"
 
     if args.sweep_id:
         # ── sweep agent mode ──────────────────────────────────────────────────
