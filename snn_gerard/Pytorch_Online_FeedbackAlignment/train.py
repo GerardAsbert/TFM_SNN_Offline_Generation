@@ -31,6 +31,7 @@ from tqdm import tqdm
 import wandb
 
 from models import HandwritingSNN
+from grad_health import log_gradient_health
 
 
 # ── reproducibility ────────────────────────────────────────────────────────────
@@ -42,15 +43,15 @@ torch.manual_seed(rng_seed)
 # ── sweep defaults ─────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
-    "threshold":            0.06,
-    "w_gain":               0.1,
-    "lr":                   5e-4,
-    "gamma":                0.79,
-    "c_reg":                99.90,
-    "n_rec":                800,
-    "tau_a_ms":             213.36,
-    "prob":                 0.12,
-    "learning_signal_mode": "symmetric",
+    "threshold":            1.0,
+    "w_gain":               1.0,
+    "lr":                   5e-3,
+    "gamma":                0.3,
+    "c_reg":                0,
+    "n_rec":                200,
+    "tau_a_ms":             2000,
+    "prob":                 0.05,
+    "learning_signal_mode": "random",
 }
 
 
@@ -129,32 +130,32 @@ def build_targets(
     n_sequences: int,
     seq_T: int,
     data_point: int,
-    traj_idx_per_seq,   # (n_sequences,) int array: index into datos_letras
+    traj_idx_per_seq,
 ) -> np.ndarray:
-    """
-    Interpolate each trajectory to seq_T timesteps and compute cumulative
-    (dx, dy, pen) targets. Returns float32 array of shape (n_sequences, seq_T, 3).
-    """
+
     x_eval = np.arange(seq_T) / data_point
     x_data = np.arange(seq_T // data_point)
 
     targets = np.empty((n_sequences, seq_T, 3), dtype=np.float32)
+
     for i in range(n_sequences):
         raw = datos_letras[int(traj_idx_per_seq[i])]
-        dx_c = np.cumsum(raw[:, 0].astype(float))
-        dy_c = np.cumsum(raw[:, 1].astype(float))
-        if np.max(np.abs(dx_c)) > 0:
-            dx_c /= np.max(np.abs(dx_c))
-        dx_c -= dx_c[0]
-        if np.max(np.abs(dy_c)) > 0:
-            dy_c /= np.max(np.abs(dy_c))
-        dy_c -= dy_c[0]
-        pen = raw[:, 2].astype(float) if raw.shape[1] >= 3 else np.ones(raw.shape[0])
-        targets[i, :, 0] = np.interp(x_eval, x_data, dx_c).astype(np.float32)
-        targets[i, :, 1] = np.interp(x_eval, x_data, dy_c).astype(np.float32)
-        targets[i, :, 2] = np.clip(np.interp(x_eval, x_data, pen), 0.0, 1.0).astype(np.float32)
+
+        dx = raw[:, 0].astype(np.float32)
+        dy = raw[:, 1].astype(np.float32)
+        pen = raw[:, 2].astype(np.float32) if raw.shape[1] >= 3 else np.ones(len(raw), dtype=np.float32)
+
+        # IMPORTANT: NO cumsum
+        targets[i, :, 0] = np.interp(x_eval, x_data, dx)
+        targets[i, :, 1] = np.interp(x_eval, x_data, dy)
+        targets[i, :, 2] = np.clip(np.interp(x_eval, x_data, pen), 0.0, 1.0)
+
     return targets
 
+def integrate(dx, dy):
+    x = np.cumsum(dx)
+    y = np.cumsum(dy)
+    return x, y
 
 # ── spike-train generators ─────────────────────────────────────────────────────
 
@@ -366,11 +367,13 @@ def analyze_and_plot(
         idxs = np.where(traj_idx_per_seq == li)[0]
         last_i = idxs[-1]
 
-        r_dx  = outputs[last_i, :, 0]
-        r_dy  = -outputs[last_i, :, 1]
+        r_dx_raw = outputs[last_i, :, 0]
+        r_dy_raw = -outputs[last_i, :, 1]
+        t_dx_raw = targets[last_i, :, 0]
+        t_dy_raw = -targets[last_i, :, 1]
+        r_x, r_y = integrate(r_dx_raw, r_dy_raw)
+        t_x, t_y = integrate(t_dx_raw, t_dy_raw)
         r_pen = outputs[last_i, :, 2]
-        t_dx  = targets[last_i, :, 0]
-        t_dy  = -targets[last_i, :, 1]
         t_pen = targets[last_i, :, 2]
 
         mR  = r_pen >= 0.5
@@ -385,12 +388,12 @@ def analyze_and_plot(
             f"val/mse_x_{nombre_base}": mse_x,
             f"val/mse_y_{nombre_base}": mse_y,
             f"val/mse_avg_{nombre_base}": mse_avg,
-        })
+        })   
 
         fig, ax = plt.subplots(figsize=(6, 3))
-        for xs, ys in _segments_from_mask(t_dx, t_dy, mT):
+        for xs, ys in _segments_from_mask(t_x, t_y, mT):
             ax.plot(xs, ys, color="tab:blue", label="target", alpha=0.85)
-        for xs, ys in _segments_from_mask(r_dx, r_dy, mR):
+        for xs, ys in _segments_from_mask(r_x, r_y, mR):
             ax.plot(xs, ys, color="tab:red", label="readout", linewidth=1)
         ax.set_title(f"{nombre_base}  MSE X:{mse_x:.4f} Y:{mse_y:.4f}")
         ax.axis("equal")
@@ -414,15 +417,19 @@ def analyze_and_plot(
             idxs = np.where(traj_idx_per_seq == li)[0]
             last_i = idxs[-1]
             offset = col * espacio
-            r_dx  = outputs[last_i, :, 0] + offset
-            r_dy  = -outputs[last_i, :, 1]
-            t_dx  = targets[last_i, :, 0] + offset
-            t_dy  = -targets[last_i, :, 1]
+            r_dx_raw = outputs[last_i, :, 0]
+            r_dy_raw = -outputs[last_i, :, 1]
+            t_dx_raw = targets[last_i, :, 0]
+            t_dy_raw = -targets[last_i, :, 1]
+            r_x, r_y = integrate(r_dx_raw, r_dy_raw)
+            t_x, t_y = integrate(t_dx_raw, t_dy_raw)
+            r_x += offset
+            t_x += offset
             mR = outputs[last_i, :, 2] >= 0.5
             mT = targets[last_i, :, 2] >= 0.5
-            for xs, ys in _segments_from_mask(t_dx, t_dy, mT):
+            for xs, ys in _segments_from_mask(t_x, t_y, mT):
                 ax.plot(xs, ys, color="blue", alpha=0.6)
-            for xs, ys in _segments_from_mask(r_dx, r_dy, mR):
+            for xs, ys in _segments_from_mask(r_x, r_y, mR):
                 ax.plot(xs, ys, color="red", alpha=0.85)
             try:
                 label = chr(int(nombre_base))
@@ -567,6 +574,9 @@ def run_training(
             _log_character_images_to_wandb(
                 model, spikes_torch, letras_ids, targets_torch, trayectorias, it + 1
             )
+
+        if (it + 1) % 50 == 0:
+            log_gradient_health(model, x_b, t_b, step=it + 1)
 
         if (it + 1) % 100 == 0:
             print(f"  iter {it + 1:5d}/{n_iter}  loss={loss_val:.6f}")
@@ -733,8 +743,8 @@ def main():
     n_batch    = 32
     output_dir = "char_style_outputs_pytorch"
 
-    #dataset_path = args.dataset_path or "/data/gasbert/TFM_SNN/HOMUS_PROCESSED_mini"
-    dataset_path = args.dataset_path or "/data/113-2/users/gasbert/HOMUS_PROCESSED_mini"
+    dataset_path = args.dataset_path or "/data/gasbert/TFM_SNN/HOMUS_PROCESSED_mini"
+    #dataset_path = args.dataset_path or "/data/113-2/users/gasbert/HOMUS_PROCESSED_mini"
 
     if args.sweep_id:
         # ── sweep agent mode ──────────────────────────────────────────────────
