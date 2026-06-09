@@ -130,32 +130,34 @@ def build_targets(
     n_sequences: int,
     seq_T: int,
     data_point: int,
-    traj_idx_per_seq,
+    traj_idx_per_seq,   # (n_sequences,) int array: index into datos_letras
 ) -> np.ndarray:
-
+    """
+    Interpolate each trajectory to seq_T timesteps and compute cumulative
+    (dx, dy, pen) targets. Returns float32 array of shape (n_sequences, seq_T, 3).
+    """
     x_eval = np.arange(seq_T) / data_point
     x_data = np.arange(seq_T // data_point)
 
     targets = np.empty((n_sequences, seq_T, 3), dtype=np.float32)
-
     for i in range(n_sequences):
         raw = datos_letras[int(traj_idx_per_seq[i])]
-
-        dx = raw[:, 0].astype(np.float32)
-        dy = raw[:, 1].astype(np.float32)
-        pen = raw[:, 2].astype(np.float32) if raw.shape[1] >= 3 else np.ones(len(raw), dtype=np.float32)
-
-        # IMPORTANT: NO cumsum
-        targets[i, :, 0] = np.interp(x_eval, x_data, dx)
-        targets[i, :, 1] = np.interp(x_eval, x_data, dy)
-        targets[i, :, 2] = np.clip(np.interp(x_eval, x_data, pen), 0.0, 1.0)
-
+        dx_c = np.cumsum(raw[:, 0].astype(float))
+        dy_c = np.cumsum(raw[:, 1].astype(float))
+        if np.max(np.abs(dx_c)) > 0:
+            dx_c /= np.max(np.abs(dx_c))
+        dx_c -= dx_c[0]
+        if np.max(np.abs(dy_c)) > 0:
+            dy_c /= np.max(np.abs(dy_c))
+        dy_c -= dy_c[0]
+        pen = raw[:, 2].astype(float) if raw.shape[1] >= 3 else np.ones(raw.shape[0])
+        dx_pos = np.interp(x_eval, x_data, dx_c)
+        dy_pos = np.interp(x_eval, x_data, dy_c)
+        targets[i, :, 0] = np.diff(dx_pos, prepend=dx_pos[0]).astype(np.float32)
+        targets[i, :, 1] = np.diff(dy_pos, prepend=dy_pos[0]).astype(np.float32)
+        targets[i, :, 2] = np.clip(np.interp(x_eval, x_data, pen), 0.0, 1.0).astype(np.float32)
     return targets
 
-def integrate(dx, dy):
-    x = np.cumsum(dx)
-    y = np.cumsum(dy)
-    return x, y
 
 # ── spike-train generators ─────────────────────────────────────────────────────
 
@@ -306,6 +308,13 @@ def generate_spikes_modal1(
         result[i] = combined.T.astype(np.float32)   # (seq_T, n_in)
     return result
 
+def _to_positions(arr):
+    """Integrate velocity channels (0,1) back to absolute positions via cumulative
+    sum along time. Channel 2 (pen) is left unchanged. Works for (..., T, 3)."""
+    out = arr.copy()
+    out[..., 0] = np.cumsum(arr[..., 0], axis=-1)
+    out[..., 1] = np.cumsum(arr[..., 1], axis=-1)
+    return out
 
 # ── analysis and plots ─────────────────────────────────────────────────────────
 
@@ -335,6 +344,9 @@ def analyze_and_plot(
 ):
     """Post-training analysis: loss curve, per-letter MSE, trajectory plots."""
     os.makedirs(output_dir, exist_ok=True)
+
+    outputs = _to_positions(outputs)
+    targets = _to_positions(targets)
 
     if loss_history:
         fig_loss = plt.figure()
@@ -367,13 +379,11 @@ def analyze_and_plot(
         idxs = np.where(traj_idx_per_seq == li)[0]
         last_i = idxs[-1]
 
-        r_dx_raw = outputs[last_i, :, 0]
-        r_dy_raw = -outputs[last_i, :, 1]
-        t_dx_raw = targets[last_i, :, 0]
-        t_dy_raw = -targets[last_i, :, 1]
-        r_x, r_y = integrate(r_dx_raw, r_dy_raw)
-        t_x, t_y = integrate(t_dx_raw, t_dy_raw)
+        r_dx  = outputs[last_i, :, 0]
+        r_dy  = -outputs[last_i, :, 1]
         r_pen = outputs[last_i, :, 2]
+        t_dx  = targets[last_i, :, 0]
+        t_dy  = -targets[last_i, :, 1]
         t_pen = targets[last_i, :, 2]
 
         mR  = r_pen >= 0.5
@@ -388,12 +398,12 @@ def analyze_and_plot(
             f"val/mse_x_{nombre_base}": mse_x,
             f"val/mse_y_{nombre_base}": mse_y,
             f"val/mse_avg_{nombre_base}": mse_avg,
-        })   
+        })
 
         fig, ax = plt.subplots(figsize=(6, 3))
-        for xs, ys in _segments_from_mask(t_x, t_y, mT):
+        for xs, ys in _segments_from_mask(t_dx, t_dy, mT):
             ax.plot(xs, ys, color="tab:blue", label="target", alpha=0.85)
-        for xs, ys in _segments_from_mask(r_x, r_y, mR):
+        for xs, ys in _segments_from_mask(r_dx, r_dy, mR):
             ax.plot(xs, ys, color="tab:red", label="readout", linewidth=1)
         ax.set_title(f"{nombre_base}  MSE X:{mse_x:.4f} Y:{mse_y:.4f}")
         ax.axis("equal")
@@ -417,19 +427,15 @@ def analyze_and_plot(
             idxs = np.where(traj_idx_per_seq == li)[0]
             last_i = idxs[-1]
             offset = col * espacio
-            r_dx_raw = outputs[last_i, :, 0]
-            r_dy_raw = -outputs[last_i, :, 1]
-            t_dx_raw = targets[last_i, :, 0]
-            t_dy_raw = -targets[last_i, :, 1]
-            r_x, r_y = integrate(r_dx_raw, r_dy_raw)
-            t_x, t_y = integrate(t_dx_raw, t_dy_raw)
-            r_x += offset
-            t_x += offset
+            r_dx  = outputs[last_i, :, 0] + offset
+            r_dy  = -outputs[last_i, :, 1]
+            t_dx  = targets[last_i, :, 0] + offset
+            t_dy  = -targets[last_i, :, 1]
             mR = outputs[last_i, :, 2] >= 0.5
             mT = targets[last_i, :, 2] >= 0.5
-            for xs, ys in _segments_from_mask(t_x, t_y, mT):
+            for xs, ys in _segments_from_mask(t_dx, t_dy, mT):
                 ax.plot(xs, ys, color="blue", alpha=0.6)
-            for xs, ys in _segments_from_mask(r_x, r_y, mR):
+            for xs, ys in _segments_from_mask(r_dx, r_dy, mR):
                 ax.plot(xs, ys, color="red", alpha=0.85)
             try:
                 label = chr(int(nombre_base))
@@ -460,8 +466,8 @@ def _log_character_images_to_wandb(
             last_i = idxs[-1]
 
             x = spikes_torch[li].unsqueeze(0)         # (1, T, n_in)
-            out = model(x).cpu().numpy()[0]            # (T, 3)
-            tgt = targets_torch[last_i].cpu().numpy()  # (T, 3)
+            out = _to_positions(model(x).cpu().numpy()[0])   # (T, 3) -> positions
+            tgt = _to_positions(targets_torch[last_i].cpu().numpy())
 
             r_dx  = out[:, 0]; r_dy = -out[:, 1]; r_pen = out[:, 2]
             t_dx  = tgt[:, 0]; t_dy = -tgt[:, 1]; t_pen = tgt[:, 2]
