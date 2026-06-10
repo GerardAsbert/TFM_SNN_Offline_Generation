@@ -129,7 +129,7 @@ class HandwritingSNN(nn.Module):
         n_out: int = 3,
         tau_m_ms: float = 30.0,
         tau_a_ms: float = 2000.0,
-        tau_out_ms: float = 50.0,
+        tau_out_ms: float = 5.0,
         dt: float = 1.0,
         threshold: float = 0.03,
         gamma: float = 0.3,
@@ -175,6 +175,8 @@ class HandwritingSNN(nn.Module):
                 torch.randn(n_rec, n_out) / math.sqrt(n_rec)
             )
 
+        self.register_buffer("loss_weights", torch.tensor([30.0, 30.0, 1.0]))
+
 
     def forward(self, x: torch.Tensor, targets: torch.Tensor = None, log_step: int = None) -> torch.Tensor:
         """
@@ -210,6 +212,10 @@ class HandwritingSNN(nn.Module):
         # Eligibility trace for output neurons
         z_out_trace = torch.zeros(batch, self.n_rec, device=device)
 
+        psi_prev = torch.zeros(batch, self.n_rec, device=device)
+        bar_e_in  = torch.zeros(batch, self.n_rec, self.n_in,  device=device)
+        bar_e_rec = torch.zeros(batch, self.n_rec, self.n_rec, device=device)
+
 
         if training:
             grad_inp = torch.zeros_like(self.hidden_layer.input_weights.weight)
@@ -236,45 +242,32 @@ class HandwritingSNN(nn.Module):
                     x_pre = x_t.unsqueeze(1)
                     z_pre = z_h.unsqueeze(1)
                     psi = sg.unsqueeze(-1)
-
+                    psi_pr = psi_prev.unsqueeze(-1)
+                    
                     # Eligibility traces (ET) (low-pass filtered pre-synaptic activity)
                     # epsilon regarding voltage of input neurons
-                    eps_v_in_new = (
-                        self.hidden_layer.tau_m * eps_v_in
-                        - self.hidden_layer.adapt_beta * psi * eps_a_in
-                        + x_pre
-                    )
+                    eps_v_in_new = self.hidden_layer.tau_m * eps_v_in + x_pre
+
                     # epsilon regarding adaptation of input neurons
-                    eps_a_in_new = (
-                        psi * eps_v_in_new
-                        + self.hidden_layer.tau_a * eps_a_in
-                    )
+                    eps_a_in_new  = psi_pr * eps_v_in  + (self.hidden_layer.tau_a - self.hidden_layer.adapt_beta * psi_pr) * eps_a_in
+
                     # epsilon regarding voltage of recurrent neurons
-                    eps_v_rec_new = (
-                        self.hidden_layer.tau_m * eps_v_rec
-                        - self.hidden_layer.adapt_beta * psi * eps_a_rec
-                        + z_pre
-                    )
+                    eps_v_rec_new = self.hidden_layer.tau_m * eps_v_rec + z_pre
+
                     # epsilon regarding adaptation of recurrent neurons
-                    eps_a_rec_new = (
-                        psi * eps_v_rec_new
-                        + self.hidden_layer.tau_a * eps_a_rec
-                    )
+                    eps_a_rec_new = psi_pr * eps_v_rec + (self.hidden_layer.tau_a - self.hidden_layer.adapt_beta * psi_pr) * eps_a_rec
 
                     # ET for input neurons
-                    e_in = psi * (
-                        eps_v_in_new
-                        - self.hidden_layer.adapt_beta * eps_a_in_new
-                    )
+                    e_in = psi * (eps_v_in_new - self.hidden_layer.adapt_beta * eps_a_in_new)
+
                     # ET for recurrent neurons
-                    e_rec = psi * (
-                        eps_v_rec_new
-                        - self.hidden_layer.adapt_beta * eps_a_rec_new
-                    )
+                    e_rec = psi * (eps_v_rec_new - self.hidden_layer.adapt_beta * eps_a_rec_new)
+                    
                     # ET for output neurons
                     z_out_trace = self.tau_out * z_out_trace + z_h_new
 
                     output_error = v_out - targets[:, t, :]           # (batch, n_out)
+                    output_error = output_error * self.loss_weights   # (n_out,) e.g. [30., 30., 1.]
 
                     if t % 10 == 0:
                         error_scalar = output_error.abs().mean().item()
@@ -304,9 +297,10 @@ class HandwritingSNN(nn.Module):
                         f_avg = tau_trace * f_avg + (1.0 - tau_trace) * z_h_new
                         learning_signal = learning_signal + self.c_reg * (f_avg - self.f_target)
 
-                    #post_factor = learning_signal * sg                 # (batch, n_rec)
-                    grad_inp += torch.einsum("bj,bji->ji", learning_signal, e_in) / batch
-                    grad_rec += torch.einsum("bj,bji->ji", learning_signal, e_rec) / batch
+                    bar_e_in  = self.tau_out * bar_e_in  + e_in
+                    bar_e_rec = self.tau_out * bar_e_rec + e_rec
+                    grad_inp += torch.einsum("bj,bji->ji", learning_signal, bar_e_in)  / batch
+                    grad_rec += torch.einsum("bj,bji->ji", learning_signal, bar_e_rec) / batch
                     grad_out += torch.einsum("bo,bh->oh", output_error, z_out_trace) / batch
 
                     wandb.log({
@@ -322,6 +316,7 @@ class HandwritingSNN(nn.Module):
                     eps_a_rec = eps_a_rec_new
 
                 z_h = z_h_new
+                psi_prev = sg
 
         if training:
             self.hidden_layer.input_weights.weight.grad = grad_inp

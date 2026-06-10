@@ -20,6 +20,10 @@ import pickle
 import numpy as np
 import torch
 import torch.optim as optim
+
+import matplotlib
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 from collections import defaultdict
 from sklearn.metrics import mean_squared_error
@@ -27,6 +31,7 @@ from tqdm import tqdm
 import wandb
 
 from models import HandwritingSNN
+from grad_health import log_gradient_health
 
 
 # ── reproducibility ────────────────────────────────────────────────────────────
@@ -38,15 +43,15 @@ torch.manual_seed(rng_seed)
 # ── sweep defaults ─────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
-    "threshold":            0.03,
+    "threshold":            1.0,
     "w_gain":               1.0,
-    "lr":                   5e-3,
+    "lr":                   1e-3,
     "gamma":                0.3,
-    "c_reg":                150.0,
-    "n_rec":                400,
-    "tau_a_ms":             2000.0,
+    "c_reg":                1.0,
+    "n_rec":                200,
+    "tau_a_ms":             2000,
     "prob":                 0.05,
-    "learning_signal_mode": "symmetric",
+    "learning_signal_mode": "random",
 }
 
 
@@ -146,8 +151,10 @@ def build_targets(
             dy_c /= np.max(np.abs(dy_c))
         dy_c -= dy_c[0]
         pen = raw[:, 2].astype(float) if raw.shape[1] >= 3 else np.ones(raw.shape[0])
-        targets[i, :, 0] = np.interp(x_eval, x_data, dx_c).astype(np.float32)
-        targets[i, :, 1] = np.interp(x_eval, x_data, dy_c).astype(np.float32)
+        dx_pos = np.interp(x_eval, x_data, dx_c)
+        dy_pos = np.interp(x_eval, x_data, dy_c)
+        targets[i, :, 0] = np.diff(dx_pos, prepend=dx_pos[0]).astype(np.float32)
+        targets[i, :, 1] = np.diff(dy_pos, prepend=dy_pos[0]).astype(np.float32)
         targets[i, :, 2] = np.clip(np.interp(x_eval, x_data, pen), 0.0, 1.0).astype(np.float32)
     return targets
 
@@ -301,6 +308,13 @@ def generate_spikes_modal1(
         result[i] = combined.T.astype(np.float32)   # (seq_T, n_in)
     return result
 
+def _to_positions(arr):
+    """Integrate velocity channels (0,1) back to absolute positions via cumulative
+    sum along time. Channel 2 (pen) is left unchanged. Works for (..., T, 3)."""
+    out = arr.copy()
+    out[..., 0] = np.cumsum(arr[..., 0], axis=-1)
+    out[..., 1] = np.cumsum(arr[..., 1], axis=-1)
+    return out
 
 # ── analysis and plots ─────────────────────────────────────────────────────────
 
@@ -330,6 +344,9 @@ def analyze_and_plot(
 ):
     """Post-training analysis: loss curve, per-letter MSE, trajectory plots."""
     os.makedirs(output_dir, exist_ok=True)
+
+    outputs = _to_positions(outputs)
+    targets = _to_positions(targets)
 
     if loss_history:
         fig_loss = plt.figure()
@@ -449,8 +466,8 @@ def _log_character_images_to_wandb(
             last_i = idxs[-1]
 
             x = spikes_torch[li].unsqueeze(0)         # (1, T, n_in)
-            out = model(x).cpu().numpy()[0]            # (T, 3)
-            tgt = targets_torch[last_i].cpu().numpy()  # (T, 3)
+            out = _to_positions(model(x).cpu().numpy()[0])   # (T, 3) -> positions
+            tgt = _to_positions(targets_torch[last_i].cpu().numpy())
 
             r_dx  = out[:, 0]; r_dy = -out[:, 1]; r_pen = out[:, 2]
             t_dx  = tgt[:, 0]; t_dy = -tgt[:, 1]; t_pen = tgt[:, 2]
@@ -563,6 +580,9 @@ def run_training(
             _log_character_images_to_wandb(
                 model, spikes_torch, letras_ids, targets_torch, trayectorias, it + 1
             )
+
+        if (it + 1) % 50 == 0:
+            log_gradient_health(model, x_b, t_b, step=it + 1)
 
         if (it + 1) % 100 == 0:
             print(f"  iter {it + 1:5d}/{n_iter}  loss={loss_val:.6f}")
@@ -725,11 +745,12 @@ def main():
     print("torch.cuda.is_available():", torch.cuda.is_available())
     print("torch.cuda.device_count():", torch.cuda.device_count())
 
-    n_iter     = 1000
+    n_iter     = 1200
     n_batch    = 32
     output_dir = "char_style_outputs_pytorch"
 
     dataset_path = args.dataset_path or "/data/gasbert/TFM_SNN/HOMUS_PROCESSED_mini"
+    #dataset_path = args.dataset_path or "/data/113-2/users/gasbert/HOMUS_PROCESSED_mini"
 
     if args.sweep_id:
         # ── sweep agent mode ──────────────────────────────────────────────────
