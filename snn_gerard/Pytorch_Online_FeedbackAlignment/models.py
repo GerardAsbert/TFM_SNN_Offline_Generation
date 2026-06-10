@@ -129,7 +129,7 @@ class HandwritingSNN(nn.Module):
         n_out: int = 3,
         tau_m_ms: float = 30.0,
         tau_a_ms: float = 2000.0,
-        tau_out_ms: float = 50.0,
+        tau_out_ms: float = 5.0,
         dt: float = 1.0,
         threshold: float = 0.03,
         gamma: float = 0.3,
@@ -174,6 +174,8 @@ class HandwritingSNN(nn.Module):
             self.B = nn.Parameter(
                 torch.randn(n_rec, n_out) / math.sqrt(n_rec)
             )
+
+        self.register_buffer("loss_weights", torch.tensor([30.0, 30.0, 1.0]))
 
 
     def forward(self, x: torch.Tensor, targets: torch.Tensor = None, log_step: int = None) -> torch.Tensor:
@@ -265,6 +267,7 @@ class HandwritingSNN(nn.Module):
                     z_out_trace = self.tau_out * z_out_trace + z_h_new
 
                     output_error = v_out - targets[:, t, :]           # (batch, n_out)
+                    output_error = output_error * self.loss_weights   # (n_out,) e.g. [30., 30., 1.]
 
                     if t % 10 == 0:
                         error_scalar = output_error.abs().mean().item()

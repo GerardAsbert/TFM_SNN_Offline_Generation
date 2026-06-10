@@ -45,9 +45,9 @@ torch.manual_seed(rng_seed)
 DEFAULT_CONFIG = {
     "threshold":            1.0,
     "w_gain":               1.0,
-    "lr":                   5e-3,
+    "lr":                   1e-3,
     "gamma":                0.3,
-    "c_reg":                0,
+    "c_reg":                1.0,
     "n_rec":                200,
     "tau_a_ms":             2000,
     "prob":                 0.05,

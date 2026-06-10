@@ -3,7 +3,7 @@ import wandb
 
 
 @torch.no_grad()
-def log_gradient_health(model, x, targets, step, rel=0.02, n_seqs=8, prefix="graddiag"):
+def log_gradient_health(model, x, targets, step, rel=0.002, n_seqs=8, prefix="graddiag"):
     """
     Tripwire for the e-prop "gradients don't point downhill" bug.
 
