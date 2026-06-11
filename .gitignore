@@ -1,3 +1,7 @@
 N-MNIST/
 *.zip
-snn_gerard/Pytorch_Online_FeedbackAlignment/wandb/
+/snn_gerard/pytorch_online/wandb/
+/snn_gerard/pytorch_offline/wandb/
+/snn_gerard/pytorch_offline/char_style_outputs_pytorch/
+/snn_gerard/pytorch_online/char_style_outputs_pytorch/
+*.pyc

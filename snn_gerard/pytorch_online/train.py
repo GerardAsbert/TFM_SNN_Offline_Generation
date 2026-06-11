@@ -51,7 +51,7 @@ DEFAULT_CONFIG = {
     "n_rec":                200,
     "tau_a_ms":             2000,
     "prob":                 0.05,
-    "learning_signal_mode": "random",
+    "learning_signal_mode": "symmetric",
 }
 
 
@@ -156,6 +156,11 @@ def build_targets(
         targets[i, :, 0] = np.diff(dx_pos, prepend=dx_pos[0]).astype(np.float32)
         targets[i, :, 1] = np.diff(dy_pos, prepend=dy_pos[0]).astype(np.float32)
         targets[i, :, 2] = np.clip(np.interp(x_eval, x_data, pen), 0.0, 1.0).astype(np.float32)
+    vel_scale = float(targets[:, :, :2].std())
+    if vel_scale < 1e-8:
+        vel_scale = 1.0
+    targets[:, :, :2] /= vel_scale
+    print(f"[build_targets] velocity std = {vel_scale:.6g}  (targets standardized)")
     return targets
 
 
@@ -517,6 +522,8 @@ def run_training(
     gamma: float = 0.3,
     threshold: float = 0.03,
     w_gain: float = 1.0,
+    tau_m_ms: float = 30.0,
+    tau_out_ms: float = 5.0,
     trayectorias=None,
 ):
     print("At the start of run_training:")
@@ -536,6 +543,8 @@ def run_training(
         c_reg=c_reg, f_target=f_target,
         learning_signal_mode=learning_signal_mode,
         tau_a_ms=tau_a_ms,
+        tau_m_ms=tau_m_ms,
+        tau_out_ms=tau_out_ms,
         gamma=gamma,
         threshold=threshold,
         w_gain=w_gain,
@@ -569,12 +578,24 @@ def run_training(
         out = model(x_b, targets=t_b, log_step=it)   # e-prop gradients assigned inside forward()
 
         # MSE (for logging only — no .backward() needed)
-        loss_val = 0.5 * float((out - t_b).pow(2).sum(dim=-1).mean())
+        sq = (out - t_b).pow(2)                       # (B, T, 3)
+        loss_val = 0.5 * float(sq.sum(dim=-1).mean()) # unweighted (old metric)
+
+        mse_per_ch = sq.mean(dim=(0, 1))              # (3,) -> dx, dy, pen
+        lw = model.loss_weights                       # tensor([30., 30., 1.])
+        loss_weighted = 0.5 * float((sq * lw).sum(dim=-1).mean())
+
         loss_history.append(loss_val)
 
         optimizer.step()
 
-        wandb.log({"train/loss": loss_val})
+        wandb.log({
+            "train/loss":          loss_val,
+            "train/loss_weighted": loss_weighted,
+            "train/mse_dx":        float(mse_per_ch[0]),
+            "train/mse_dy":        float(mse_per_ch[1]),
+            "train/mse_pen":       float(mse_per_ch[2]),
+        })
 
         if (it + 1) % 10 == 0 and trayectorias is not None:
             _log_character_images_to_wandb(
@@ -692,6 +713,8 @@ def build_and_train(dataset_path: str, output_dir: str, n_iter: int, n_batch: in
         c_reg=float(cfg.c_reg),
         f_target=f_target,
         tau_a_ms=float(cfg.tau_a_ms),
+        tau_m_ms=float(cfg.tau_m_ms),
+        tau_out_ms=float(cfg.tau_out_ms),
         gamma=float(cfg.gamma),
         threshold=float(cfg.threshold),
         w_gain=float(cfg.w_gain),
@@ -745,11 +768,11 @@ def main():
     print("torch.cuda.is_available():", torch.cuda.is_available())
     print("torch.cuda.device_count():", torch.cuda.device_count())
 
-    n_iter     = 1200
+    n_iter     = 2000
     n_batch    = 32
     output_dir = "char_style_outputs_pytorch"
 
-    dataset_path = args.dataset_path or "/data/gasbert/TFM_SNN/HOMUS_PROCESSED_mini"
+    dataset_path = args.dataset_path or "/data/gasbert/TFM_SNN/HOMUS_PROCESSED_mini_online"
     #dataset_path = args.dataset_path or "/data/113-2/users/gasbert/HOMUS_PROCESSED_mini"
 
     if args.sweep_id:

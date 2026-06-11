@@ -15,6 +15,51 @@ import torch
 import torch.nn as nn
 import wandb
 
+def render_trajectory(vel, H, W, sigma=1.5):
+    """
+    Differentiable rasterizer.
+    vel: (batch, T, 3) readout — channels (dx, dy) velocities + pen logit.
+    Draws CONNECTED line segments between consecutive pen-down points, so
+    strokes are continuous regardless of per-step size.
+    Returns soft grayscale image (batch, H, W) in [0, 1].
+    """
+    batch, T, _ = vel.shape
+    device = vel.device
+    eps = 1e-6
+
+    pos_x = torch.cumsum(vel[:, :, 0], dim=1)            # velocities -> positions
+    pos_y = torch.cumsum(vel[:, :, 1], dim=1)
+    pen   = torch.sigmoid(vel[:, :, 2] * 5.0)            # soft pen-down weight (0,1)
+
+    gx = (pos_x * 0.5 + 0.5) * (W - 1)                   # (batch, T) pixel coords
+    gy = (pos_y * 0.5 + 0.5) * (H - 1)
+
+    # segment endpoints: A = point k, B = point k+1   (k = 0 .. T-2)
+    ax = gx[:, :-1].view(batch, 1, 1, T - 1)
+    ay = gy[:, :-1].view(batch, 1, 1, T - 1)
+    bx = gx[:, 1:].view(batch, 1, 1, T - 1)
+    by = gy[:, 1:].view(batch, 1, 1, T - 1)
+
+    xs = torch.arange(W, device=device).view(1, 1, W, 1).float()
+    ys = torch.arange(H, device=device).view(1, H, 1, 1).float()
+
+    # closest point on each segment to each pixel
+    abx = bx - ax; aby = by - ay
+    apx = xs - ax; apy = ys - ay
+    ab2 = abx * abx + aby * aby + eps
+    t = ((apx * abx + apy * aby) / ab2).clamp(0.0, 1.0)  # projection param in [0,1]
+    cx = ax + t * abx; cy = ay + t * aby
+    dist2 = (xs - cx) ** 2 + (ys - cy) ** 2              # (batch, H, W, T-1)
+
+    splat = torch.exp(-dist2 / (2 * sigma * sigma))
+
+    # a segment is inked only if BOTH endpoints are pen-down
+    seg_pen = (pen[:, :-1] * pen[:, 1:]).view(batch, 1, 1, T - 1)
+    splat = splat * seg_pen
+
+    img = splat.max(dim=-1).values                       # union of segments
+    return img.clamp(0.0, 1.0)
+
 
 class AdaptiveLIFLayer(nn.Module):
     """
@@ -137,6 +182,10 @@ class HandwritingSNN(nn.Module):
         c_reg: float = 0.0,       # regularisation coefficient (0 = off)
         learning_signal_mode: str = "symmetric",
         w_gain: float = 1.0,      # weight init gain multiplier
+        img_H: int = 32,          # output raster height
+        img_W: int = 32,          # output raster width
+        render_sigma: float = 1.5,  # stroke splat width (pixels)
+        fg_pos_weight: float = 20.0,  # weight of stroke pixels vs background in the loss
     ):
         super().__init__()
         self.n_in = n_in
@@ -145,6 +194,10 @@ class HandwritingSNN(nn.Module):
         self.f_target = f_target / 1000.0   # spikes per ms
         self.c_reg = c_reg
         self.learning_signal_mode = learning_signal_mode
+        self.img_H = img_H
+        self.img_W = img_W
+        self.render_sigma = render_sigma
+        self.fg_pos_weight = fg_pos_weight
 
         tau_m = math.exp(-dt / tau_m_ms)
         tau_a = math.exp(-dt / tau_a_ms)
@@ -177,8 +230,24 @@ class HandwritingSNN(nn.Module):
 
         self.register_buffer("loss_weights", torch.tensor([30.0, 30.0, 1.0]))
 
+    def _infer_trajectory(self, x: torch.Tensor) -> torch.Tensor:
+        """Plain forward pass (no e-prop bookkeeping). Returns (batch, T, n_out)."""
+        batch, T, _ = x.shape
+        device = x.device
+        v_h   = torch.zeros(batch, self.n_rec, device=device)
+        a_h   = torch.zeros(batch, self.n_rec, device=device)
+        z_h   = torch.zeros(batch, self.n_rec, device=device)
+        v_out = torch.zeros(batch, self.n_out, device=device)
+        outputs = []
+        with torch.no_grad():
+            for t in range(T):
+                z_h, v_h, a_h, _ = self.hidden_layer.step(x[:, t, :], v_h, a_h, z_h)
+                v_out = self.tau_out * v_out + self.readout(z_h)
+                outputs.append(v_out.clone())
+        return torch.stack(outputs, dim=1)
 
-    def forward(self, x: torch.Tensor, targets: torch.Tensor = None, log_step: int = None) -> torch.Tensor:
+
+    def forward(self, x: torch.Tensor, target_image: torch.Tensor = None, log_step: int = None) -> torch.Tensor:
         """
         Args
         ----
@@ -191,7 +260,7 @@ class HandwritingSNN(nn.Module):
         """
         batch, T, _ = x.shape
         device = x.device
-        training = targets is not None
+        training = target_image is not None
 
         v_h = torch.zeros(batch, self.n_rec, device=device)
         a_h = torch.zeros(batch, self.n_rec, device=device)
@@ -224,6 +293,22 @@ class HandwritingSNN(nn.Module):
 
             if self.learning_signal_mode == "adaptive":
                 grad_B = torch.zeros_like(self.B)
+
+            # --- pass 1: render the trajectory and backprop the image loss
+            #     through the renderer only, to get dE/dy_t for every timestep ---
+            with torch.enable_grad():
+                v_out_all = self._infer_trajectory(x)            # (batch, T, n_out)
+                traj = v_out_all.clone().requires_grad_(True)
+                pred_img = render_trajectory(
+                    traj, self.img_H, self.img_W, self.render_sigma
+                )
+                # foreground-weighted MSE: stroke pixels (target≈1) are weighted up to
+                # counteract the black-background imbalance that drives pen-up collapse.
+                # assumes strokes are the BRIGHT pixels (target high) on a dark background.
+                px_weight = 1.0 + (self.fg_pos_weight - 1.0) * target_image
+                img_loss = 0.5 * (px_weight * (pred_img - target_image).pow(2)).mean()
+                img_loss.backward()
+            precomputed_error = traj.grad 
 
         outputs = []
 
@@ -266,8 +351,7 @@ class HandwritingSNN(nn.Module):
                     # ET for output neurons
                     z_out_trace = self.tau_out * z_out_trace + z_h_new
 
-                    output_error = v_out - targets[:, t, :]           # (batch, n_out)
-                    output_error = output_error * self.loss_weights   # (n_out,) e.g. [30., 30., 1.]
+                    output_error = precomputed_error[:, t, :]         # dE/dy_t from renderer
 
                     if t % 10 == 0:
                         error_scalar = output_error.abs().mean().item()

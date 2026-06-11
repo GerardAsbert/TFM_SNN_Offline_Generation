@@ -1,0 +1,74 @@
+# W&B hyperparameter sweep for the e-prop SNN handwriting model.
+#
+# Usage:
+#   1. Create the sweep (once):
+#        wandb sweep sweep.yaml
+#      This prints a sweep ID, e.g. "entity/project/abc12345".
+#
+#   2. Launch one or more agents (each runs --sweep-count trials):
+#        python train.py --sweep-id <sweep_id> --sweep-count 50
+#      Run this command in parallel on multiple machines/GPUs to speed up the sweep.
+
+program: train.py
+method: bayes
+
+metric:
+  name: train/loss
+  goal: minimize
+
+parameters:
+
+  # ── firing dynamics ──────────────────────────────────────────────────────────
+  threshold:
+    # Primary knob for neuron saturation. Sweep over ~2 orders of magnitude.
+    distribution: log_uniform_values
+    min: 0.01
+    max: 2.0
+
+  gamma:
+    # Surrogate gradient scale — effectively a second gain on eligibility traces.
+    distribution: uniform
+    min: 0.05
+    max: 1.0
+
+  tau_a_ms:
+    # Adaptation time constant; shapes long-timescale memory and adapt_beta.
+    distribution: log_uniform_values
+    min: 100.0
+    max: 10000.0
+
+  # ── weight initialisation ────────────────────────────────────────────────────
+  w_gain:
+    # Multiplier on the 1/sqrt(fan_in) init std for both W_in and W_rec.
+    distribution: log_uniform_values
+    min: 0.1
+    max: 5.0
+
+  # ── optimiser ────────────────────────────────────────────────────────────────
+  lr:
+    distribution: log_uniform_values
+    min: 1.0e-4
+    max: 1.0e-2
+
+  # ── regularisation ───────────────────────────────────────────────────────────
+  c_reg:
+    # Firing-rate regularisation coefficient. Include 0 to allow disabling it.
+    distribution: uniform
+    min: 0.0
+    max: 500.0
+
+  # ── input drive ──────────────────────────────────────────────────────────────
+  prob:
+    # Input spike probability per neuron per timestep.
+    distribution: uniform
+    min: 0.01
+    max: 0.15
+
+  # ── architecture ─────────────────────────────────────────────────────────────
+  n_rec:
+    # Recurrent layer size. Eligibility traces scale as n_rec × n_rec.
+    values: [200, 400, 800]
+
+  # ── credit assignment ────────────────────────────────────────────────────────
+  learning_signal_mode:
+    values: ["symmetric", "random", "adaptive"]
