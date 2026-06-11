@@ -186,6 +186,7 @@ class HandwritingSNN(nn.Module):
         img_W: int = 32,          # output raster width
         render_sigma: float = 1.5,  # stroke splat width (pixels)
         fg_pos_weight: float = 20.0,  # weight of stroke pixels vs background in the loss
+        bounds_lambda: float = 5.0,   # penalty weight for leaving the canvas [-1, 1]
     ):
         super().__init__()
         self.n_in = n_in
@@ -198,6 +199,7 @@ class HandwritingSNN(nn.Module):
         self.img_W = img_W
         self.render_sigma = render_sigma
         self.fg_pos_weight = fg_pos_weight
+        self.bounds_lambda = bounds_lambda
 
         tau_m = math.exp(-dt / tau_m_ms)
         tau_a = math.exp(-dt / tau_a_ms)
@@ -307,6 +309,15 @@ class HandwritingSNN(nn.Module):
                 # assumes strokes are the BRIGHT pixels (target high) on a dark background.
                 px_weight = 1.0 + (self.fg_pos_weight - 1.0) * target_image
                 img_loss = 0.5 * (px_weight * (pred_img - target_image).pow(2)).mean()
+
+                # keep the pen inside the canvas: positions must stay in [-1, 1].
+                # relu => exactly zero gradient inside the frame, inward pull outside.
+                pos_x = torch.cumsum(traj[:, :, 0], dim=1)
+                pos_y = torch.cumsum(traj[:, :, 1], dim=1)
+                oob = (torch.relu(pos_x.abs() - 1.0).pow(2).mean()
+                     + torch.relu(pos_y.abs() - 1.0).pow(2).mean())
+                img_loss = img_loss + self.bounds_lambda * oob
+
                 img_loss.backward()
             precomputed_error = traj.grad 
 

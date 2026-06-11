@@ -443,19 +443,24 @@ def run_training(
 
             # ── pen-up collapse diagnostics ──────────────────────────────────
             pen_prob = torch.sigmoid(out[:, :, 2] * 5.0)        # (B, T), same as renderer
+            pos_x = torch.cumsum(out[:, :, 0], dim=1)
+            pos_y = torch.cumsum(out[:, :, 1], dim=1)
             wandb.log({
                 "pendiag/pen_prob_mean":   pen_prob.mean().item(),     # → 0 means collapse
-                "pendiag/pen_logit_mean":  out[:, :, 2].mean().item(), # raw pen channel
+                #"pendiag/pen_logit_mean":  out[:, :, 2].mean().item(), # raw pen channel
                 "pendiag/pred_img_mean":   pred_img.mean().item(),     # should track target
                 "pendiag/target_img_mean": img_b.mean().item(),        # reference (constant-ish)
                 "pendiag/pred_ink_frac":   (pred_img > 0.1).float().mean().item(),
                 "pendiag/target_ink_frac": (img_b   > 0.1).float().mean().item(),
+                "pendiag/oob_frac":   ((pos_x.abs() > 1.0) | (pos_y.abs() > 1.0)).float().mean().item(),
+                "pendiag/pos_absmax": float(torch.maximum(pos_x.abs().max(), pos_y.abs().max())),
             })
+
         loss_history.append(loss_val)
 
         optimizer.step()
 
-        wandb.log({"train/loss": loss_val})
+        wandb.log({"train/image_loss": loss_val})
 
         if (it + 1) % 10 == 0 and trayectorias is not None:
             _log_character_images_to_wandb(
